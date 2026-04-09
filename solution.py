@@ -20,19 +20,37 @@ import lightgbm as lgb
 
 
 CONFIG = {
+    # 路径与地址统一管理
     "DATA_DIR": ".",
     "IMAGE_DIR": "Partial image dataset",
     "OUTPUT_DIR": "output",
+    "TEXT_MODEL": "answerdotai/ModernBERT-base",
+    "VL_MODEL": "google/siglip2-base-patch16-224",
+
+    # 设备与日志
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
+    "LOG_LEVEL": "INFO",
+    "SUPPRESS_HF_WARNINGS": True,  # 是否抑制Hugging Face无关警告
+
+    # 训练基础参数
     "N_FOLDS": 5,
     "REPEATS": 2,
     "SEEDS": [42, 3407],
-    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
-    "LOG_LEVEL": "INFO",
-    "TEXT_MODEL": "answerdotai/ModernBERT-base",
-    "VL_MODEL": "google/siglip2-base-patch16-224",
     "TEXT_BATCH_SIZE": 24,
     "IMAGE_BATCH_SIZE": 16,
     "META_ALPHA": 1.0,
+
+    # 各模型与最终主模型的训练轮次配置
+    "LGB_EPOCHS": 1,
+    "CATBOOST_EPOCHS": 1,
+    "META_RIDGE_EPOCHS": 1,
+    "META_CATBOOST_EPOCHS": 1,
+
+    # 每轮训练随机抽样样本数（None表示使用全部样本）
+    "LGB_SAMPLES_PER_EPOCH": None,
+    "CATBOOST_SAMPLES_PER_EPOCH": None,
+    "META_RIDGE_SAMPLES_PER_EPOCH": None,
+    "META_CATBOOST_SAMPLES_PER_EPOCH": None,
 }
 
 logging.basicConfig(
@@ -43,6 +61,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=FutureWarning)
+if CONFIG["SUPPRESS_HF_WARNINGS"]:
+    warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+    warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 
 TEXT_COLS = [
@@ -342,6 +363,18 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
+def _sample_training_data(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    sample_size: Optional[int],
+    rng: np.random.RandomState,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    if sample_size is None or sample_size <= 0 or sample_size >= len(X):
+        return X, y
+    idx = rng.choice(len(X), size=sample_size, replace=False)
+    return X.iloc[idx], y[idx]
+
+
 def cv_oof_predict(
     estimator,
     X: pd.DataFrame,
@@ -350,6 +383,8 @@ def cv_oof_predict(
     seeds: Sequence[int],
     n_folds: int,
     fit_params: Optional[dict] = None,
+    epochs: int = 1,
+    samples_per_epoch: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[float]]:
     fit_params = fit_params or {}
     oof = np.zeros(len(X), dtype=np.float64)
@@ -361,22 +396,44 @@ def cv_oof_predict(
         rep_oof = np.zeros(len(X), dtype=np.float64)
         rep_test = np.zeros(len(X_test), dtype=np.float64)
         for fold, (tr_idx, va_idx) in enumerate(kf.split(X)):
-            model = clone(estimator)
-            if hasattr(model, "random_state"):
-                model.set_params(random_state=seed + fold)
-
             X_tr = X.iloc[tr_idx]
             y_tr = y[tr_idx]
             X_va = X.iloc[va_idx]
             y_va = y[va_idx]
 
-            model.fit(X_tr, y_tr, **fit_params)
-            pred_va = model.predict(X_va)
-            pred_te = model.predict(X_test)
+            epoch_va = np.zeros(len(X_va), dtype=np.float64)
+            epoch_te = np.zeros(len(X_test), dtype=np.float64)
+            epoch_losses: List[float] = []
+            for epoch in range(epochs):
+                model = clone(estimator)
+                if hasattr(model, "random_state"):
+                    model.set_params(random_state=seed + fold + epoch)
+                rng = np.random.RandomState(seed + rep * 1000 + fold * 100 + epoch)
+                X_epoch, y_epoch = _sample_training_data(X_tr, y_tr, samples_per_epoch, rng)
+                model.fit(X_epoch, y_epoch, **fit_params)
+                pred_va_epoch = model.predict(X_va)
+                pred_te_epoch = model.predict(X_test)
+                epoch_va += pred_va_epoch / epochs
+                epoch_te += pred_te_epoch / epochs
+                epoch_loss = rmse(y_va, pred_va_epoch)
+                epoch_losses.append(epoch_loss)
+                logger.info(
+                    "[%s] rep=%d fold=%d epoch=%d loss_rmse=%.5f sample_size=%d",
+                    model.__class__.__name__,
+                    rep + 1,
+                    fold + 1,
+                    epoch + 1,
+                    epoch_loss,
+                    len(X_epoch),
+                )
+                print(f"[{model.__class__.__name__}] rep={rep + 1} fold={fold + 1} epoch={epoch + 1} loss={epoch_loss:.5f}")
+
+            pred_va = epoch_va
+            pred_te = epoch_te
             rep_oof[va_idx] = pred_va
             rep_test += pred_te / n_folds
-            fold_scores.append(rmse(y_va, pred_va))
-            logger.info("[%s] rep=%d fold=%d rmse=%.5f", model.__class__.__name__, rep + 1, fold + 1, fold_scores[-1])
+            fold_scores.append(float(np.mean(epoch_losses)))
+            logger.info("[%s] rep=%d fold=%d avg_loss_rmse=%.5f", model.__class__.__name__, rep + 1, fold + 1, fold_scores[-1])
 
         oof += rep_oof / len(seeds)
         test_pred += rep_test / len(seeds)
@@ -391,6 +448,8 @@ def train_catboost_oof(
     cat_features: List[str],
     seeds: Sequence[int],
     n_folds: int,
+    epochs: int = 1,
+    samples_per_epoch: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     oof = np.zeros(len(X_tab), dtype=np.float64)
     test_pred = np.zeros(len(X_tab_test), dtype=np.float64)
@@ -400,24 +459,52 @@ def train_catboost_oof(
         rep_oof = np.zeros(len(X_tab), dtype=np.float64)
         rep_test = np.zeros(len(X_tab_test), dtype=np.float64)
         for fold, (tr_idx, va_idx) in enumerate(kf.split(X_tab)):
-            model = CatBoostRegressor(
-                iterations=2500,
-                learning_rate=0.03,
-                depth=8,
-                loss_function="RMSE",
-                eval_metric="RMSE",
-                random_state=seed + fold,
-                verbose=False,
-            )
-            model.fit(
-                X_tab.iloc[tr_idx],
-                y[tr_idx],
-                eval_set=(X_tab.iloc[va_idx], y[va_idx]),
-                use_best_model=True,
-                cat_features=cat_features,
-            )
-            rep_oof[va_idx] = model.predict(X_tab.iloc[va_idx])
-            rep_test += model.predict(X_tab_test) / n_folds
+            X_tr = X_tab.iloc[tr_idx]
+            y_tr = y[tr_idx]
+            X_va = X_tab.iloc[va_idx]
+            y_va = y[va_idx]
+
+            epoch_va = np.zeros(len(X_va), dtype=np.float64)
+            epoch_te = np.zeros(len(X_tab_test), dtype=np.float64)
+            epoch_losses: List[float] = []
+            for epoch in range(epochs):
+                rng = np.random.RandomState(seed + rep * 1000 + fold * 100 + epoch)
+                X_epoch, y_epoch = _sample_training_data(X_tr, y_tr, samples_per_epoch, rng)
+                model = CatBoostRegressor(
+                    iterations=2500,
+                    learning_rate=0.03,
+                    depth=8,
+                    loss_function="RMSE",
+                    eval_metric="RMSE",
+                    random_state=seed + fold + epoch,
+                    verbose=False,
+                )
+                model.fit(
+                    X_epoch,
+                    y_epoch,
+                    eval_set=(X_va, y_va),
+                    use_best_model=True,
+                    cat_features=cat_features,
+                )
+                pred_va_epoch = model.predict(X_va)
+                pred_te_epoch = model.predict(X_tab_test)
+                epoch_va += pred_va_epoch / epochs
+                epoch_te += pred_te_epoch / epochs
+                epoch_loss = rmse(y_va, pred_va_epoch)
+                epoch_losses.append(epoch_loss)
+                logger.info(
+                    "[CatBoost] rep=%d fold=%d epoch=%d loss_rmse=%.5f sample_size=%d",
+                    rep + 1,
+                    fold + 1,
+                    epoch + 1,
+                    epoch_loss,
+                    len(X_epoch),
+                )
+                print(f"[CatBoost] rep={rep + 1} fold={fold + 1} epoch={epoch + 1} loss={epoch_loss:.5f}")
+
+            rep_oof[va_idx] = epoch_va
+            rep_test += epoch_te / n_folds
+            logger.info("[CatBoost] rep=%d fold=%d avg_loss_rmse=%.5f", rep + 1, fold + 1, float(np.mean(epoch_losses)))
 
         oof += rep_oof / len(seeds)
         test_pred += rep_test / len(seeds)
@@ -457,12 +544,34 @@ def strict_meta_cv(
     seeds: Sequence[int],
     n_folds: int,
     alpha: float,
+    ridge_epochs: int = 1,
+    ridge_samples_per_epoch: Optional[int] = None,
+    catboost_epochs: int = 1,
+    catboost_samples_per_epoch: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     ridge = Ridge(alpha=alpha)
     cb = CatBoostRegressor(iterations=1500, learning_rate=0.03, depth=6, random_state=42, verbose=False)
 
-    ridge_oof, ridge_test, _ = cv_oof_predict(ridge, meta_X, y, meta_test_X, seeds=seeds, n_folds=n_folds)
-    cb_oof, cb_test = train_catboost_oof(meta_X, y, meta_test_X, cat_features=[], seeds=seeds, n_folds=n_folds)
+    ridge_oof, ridge_test, _ = cv_oof_predict(
+        ridge,
+        meta_X,
+        y,
+        meta_test_X,
+        seeds=seeds,
+        n_folds=n_folds,
+        epochs=ridge_epochs,
+        samples_per_epoch=ridge_samples_per_epoch,
+    )
+    cb_oof, cb_test = train_catboost_oof(
+        meta_X,
+        y,
+        meta_test_X,
+        cat_features=[],
+        seeds=seeds,
+        n_folds=n_folds,
+        epochs=catboost_epochs,
+        samples_per_epoch=catboost_samples_per_epoch,
+    )
 
     blend_oof = 0.5 * ridge_oof + 0.5 * cb_oof
     blend_test = 0.5 * ridge_test + 0.5 * cb_test
@@ -517,7 +626,16 @@ def main(args: argparse.Namespace) -> None:
     drop_mask = (train_bundle.image_stats["has_image"].values == 1) & (rng.rand(len(X_all)) < 0.15)
     X_all.loc[drop_mask, X_img_only.columns] = 0.0
 
-    cat_oof, cat_test = train_catboost_oof(X_tab, y, X_tab_test, cat_features=cat_features, seeds=args.seeds, n_folds=args.n_folds)
+    cat_oof, cat_test = train_catboost_oof(
+        X_tab,
+        y,
+        X_tab_test,
+        cat_features=cat_features,
+        seeds=args.seeds,
+        n_folds=args.n_folds,
+        epochs=args.catboost_epochs,
+        samples_per_epoch=args.catboost_samples_per_epoch,
+    )
 
     lgb_model = lgb.LGBMRegressor(
         objective="regression",
@@ -529,12 +647,24 @@ def main(args: argparse.Namespace) -> None:
         random_state=42,
     )
 
-    tab_oof, tab_test, _ = cv_oof_predict(lgb_model, X_tab_num, y, X_tab_num_test, seeds=args.seeds, n_folds=args.n_folds)
-    text_oof, text_test, _ = cv_oof_predict(clone(lgb_model), X_text_only, y, X_text_only_test, seeds=args.seeds, n_folds=args.n_folds)
-    img_oof, img_test, _ = cv_oof_predict(clone(lgb_model), X_img_only, y, X_img_only_test, seeds=args.seeds, n_folds=args.n_folds)
-    tt_oof, tt_test, _ = cv_oof_predict(clone(lgb_model), X_tab_text, y, X_tab_text_test, seeds=args.seeds, n_folds=args.n_folds)
-    ti_oof, ti_test, _ = cv_oof_predict(clone(lgb_model), X_tab_img, y, X_tab_img_test, seeds=args.seeds, n_folds=args.n_folds)
-    all_oof, all_test, _ = cv_oof_predict(clone(lgb_model), X_all, y, X_all_test, seeds=args.seeds, n_folds=args.n_folds)
+    tab_oof, tab_test, _ = cv_oof_predict(
+        lgb_model, X_tab_num, y, X_tab_num_test, seeds=args.seeds, n_folds=args.n_folds, epochs=args.lgb_epochs, samples_per_epoch=args.lgb_samples_per_epoch
+    )
+    text_oof, text_test, _ = cv_oof_predict(
+        clone(lgb_model), X_text_only, y, X_text_only_test, seeds=args.seeds, n_folds=args.n_folds, epochs=args.lgb_epochs, samples_per_epoch=args.lgb_samples_per_epoch
+    )
+    img_oof, img_test, _ = cv_oof_predict(
+        clone(lgb_model), X_img_only, y, X_img_only_test, seeds=args.seeds, n_folds=args.n_folds, epochs=args.lgb_epochs, samples_per_epoch=args.lgb_samples_per_epoch
+    )
+    tt_oof, tt_test, _ = cv_oof_predict(
+        clone(lgb_model), X_tab_text, y, X_tab_text_test, seeds=args.seeds, n_folds=args.n_folds, epochs=args.lgb_epochs, samples_per_epoch=args.lgb_samples_per_epoch
+    )
+    ti_oof, ti_test, _ = cv_oof_predict(
+        clone(lgb_model), X_tab_img, y, X_tab_img_test, seeds=args.seeds, n_folds=args.n_folds, epochs=args.lgb_epochs, samples_per_epoch=args.lgb_samples_per_epoch
+    )
+    all_oof, all_test, _ = cv_oof_predict(
+        clone(lgb_model), X_all, y, X_all_test, seeds=args.seeds, n_folds=args.n_folds, epochs=args.lgb_epochs, samples_per_epoch=args.lgb_samples_per_epoch
+    )
 
     # Optional branches
     tabm_preds = _try_tabm_branch(X_all.values.astype(np.float32), y.astype(np.float32), X_all_test.values.astype(np.float32))
@@ -581,7 +711,18 @@ def main(args: argparse.Namespace) -> None:
     meta_X = pd.concat([oof_df, rel_train.reset_index(drop=True)], axis=1)
     meta_X_test = pd.concat([test_df_preds, rel_test.reset_index(drop=True)], axis=1)
 
-    meta_oof, meta_test = strict_meta_cv(meta_X, y, meta_X_test, seeds=args.seeds, n_folds=args.n_folds, alpha=args.meta_alpha)
+    meta_oof, meta_test = strict_meta_cv(
+        meta_X,
+        y,
+        meta_X_test,
+        seeds=args.seeds,
+        n_folds=args.n_folds,
+        alpha=args.meta_alpha,
+        ridge_epochs=args.meta_ridge_epochs,
+        ridge_samples_per_epoch=args.meta_ridge_samples_per_epoch,
+        catboost_epochs=args.meta_catboost_epochs,
+        catboost_samples_per_epoch=args.meta_catboost_samples_per_epoch,
+    )
     logger.info("Final strict meta OOF RMSE: %.5f", rmse(y, meta_oof))
 
     submission = pd.DataFrame({"id": test_df["id"], "settlement_index": meta_test})
@@ -605,6 +746,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_batch_size", type=int, default=CONFIG["IMAGE_BATCH_SIZE"])
     parser.add_argument("--device", type=str, default=CONFIG["DEVICE"])
     parser.add_argument("--meta_alpha", type=float, default=CONFIG["META_ALPHA"])
+    parser.add_argument("--lgb_epochs", type=int, default=CONFIG["LGB_EPOCHS"])
+    parser.add_argument("--catboost_epochs", type=int, default=CONFIG["CATBOOST_EPOCHS"])
+    parser.add_argument("--meta_ridge_epochs", type=int, default=CONFIG["META_RIDGE_EPOCHS"])
+    parser.add_argument("--meta_catboost_epochs", type=int, default=CONFIG["META_CATBOOST_EPOCHS"])
+    parser.add_argument("--lgb_samples_per_epoch", type=int, default=CONFIG["LGB_SAMPLES_PER_EPOCH"])
+    parser.add_argument("--catboost_samples_per_epoch", type=int, default=CONFIG["CATBOOST_SAMPLES_PER_EPOCH"])
+    parser.add_argument("--meta_ridge_samples_per_epoch", type=int, default=CONFIG["META_RIDGE_SAMPLES_PER_EPOCH"])
+    parser.add_argument("--meta_catboost_samples_per_epoch", type=int, default=CONFIG["META_CATBOOST_SAMPLES_PER_EPOCH"])
     return parser.parse_args()
 
 
