@@ -21,8 +21,10 @@ import lightgbm as lgb
 
 CONFIG = {
     # 路径与地址统一管理
-    "DATA_DIR": ".",
-    "IMAGE_DIR": "Partial image dataset",
+    "DATA_DIR": ".",  # 兼容旧参数，默认当前目录
+    "TRAIN_CSV": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\train.csv",
+    "TEST_CSV": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\test.csv",
+    "IMAGE_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\images_dataset",
     "OUTPUT_DIR": "output",
     "TEXT_MODEL": "answerdotai/ModernBERT-base",
     "VL_MODEL": "google/siglip2-base-patch16-224",
@@ -41,10 +43,10 @@ CONFIG = {
     "META_ALPHA": 1.0,
 
     # 各模型与最终主模型的训练轮次配置
-    "LGB_EPOCHS": 1,
-    "CATBOOST_EPOCHS": 1,
-    "META_RIDGE_EPOCHS": 1,
-    "META_CATBOOST_EPOCHS": 1,
+    "LGB_EPOCHS": 3,
+    "CATBOOST_EPOCHS": 3,
+    "META_RIDGE_EPOCHS": 3,
+    "META_CATBOOST_EPOCHS": 3,
 
     # 每轮训练随机抽样样本数（None表示使用全部样本）
     "LGB_SAMPLES_PER_EPOCH": None,
@@ -99,9 +101,11 @@ class FeatureBundle:
     target: Optional[np.ndarray]
 
 
-def read_data(data_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    train = pd.read_csv(os.path.join(data_dir, "train.csv"))
-    test = pd.read_csv(os.path.join(data_dir, "test.csv"))
+def read_data(data_dir: str, train_csv: Optional[str] = None, test_csv: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    train_path = train_csv if train_csv else os.path.join(data_dir, "train.csv")
+    test_path = test_csv if test_csv else os.path.join(data_dir, "test.csv")
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
     return train, test
 
 
@@ -580,7 +584,7 @@ def strict_meta_cv(
 
 
 def main(args: argparse.Namespace) -> None:
-    train_df, test_df = read_data(args.data_dir)
+    train_df, test_df = read_data(args.data_dir, train_csv=args.train_csv, test_csv=args.test_csv)
     train_bundle = build_features(train_df, args.image_dir, args)
     test_bundle = build_features(test_df, args.image_dir, args)
 
@@ -735,6 +739,8 @@ def main(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Structured multimodal stacking pipeline for settlement index prediction")
     parser.add_argument("--data_dir", type=str, default=CONFIG["DATA_DIR"])
+    parser.add_argument("--train_csv", type=str, default=CONFIG["TRAIN_CSV"])
+    parser.add_argument("--test_csv", type=str, default=CONFIG["TEST_CSV"])
     parser.add_argument("--image_dir", type=str, default=CONFIG["IMAGE_DIR"])
     parser.add_argument("--output_dir", type=str, default=CONFIG["OUTPUT_DIR"])
     parser.add_argument("--n_folds", type=int, default=CONFIG["N_FOLDS"])
