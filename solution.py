@@ -53,8 +53,8 @@ CONFIG = {
     "TabM_epoch": 32,                   # TabM 固定训练 epoch 数
 
     # ------ 路径与基础设置 ------
-    "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
-    "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",  # 提交结果输出目录
+    "DATA_DIR": ".",                     # 训练/测试 CSV 所在目录（默认当前目录）
+    "OUTPUT_DIR": "./result",            # 提交结果输出目录
     "N_FOLDS": 5,                       # 交叉验证折数
     "RANDOM_STATE": 42,                 # 全局随机种子（fold 划分、PCA、ElasticNet 用）
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",  # 训练设备，优先 GPU
@@ -662,10 +662,9 @@ def _train_adapter_fold(X_tr, y_tr, w_tr, X_va, y_va, X_te, device):
         torch.tensor(w_tr, dtype=torch.float32),
     ), batch_size=CONFIG["ADAPTER_BATCH_SIZE"], shuffle=True)
     va_loader = DataLoader(TensorDataset(torch.tensor(X_va, dtype=torch.float32), torch.tensor(y_va, dtype=torch.float32)), batch_size=CONFIG["ADAPTER_BATCH_SIZE"], shuffle=False)
-    total_steps = max(1, CONFIG["ADAPTER_EPOCHS"] * len(tr_loader))
+    total_steps = max(1, CONFIG["TextModel_epoch"] * len(tr_loader))
     scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["ADAPTER_WARMUP_RATIO"])
-    best_state, best_mse, bad = None, float("inf"), 0
-    for _ in range(CONFIG["ADAPTER_EPOCHS"]):
+    for _ in range(CONFIG["TextModel_epoch"]):
         model.train()
         for xb, yb, wb in tr_loader:
             xb, yb, wb = xb.to(device), yb.to(device), wb.to(device)
@@ -688,16 +687,7 @@ def _train_adapter_fold(X_tr, y_tr, w_tr, X_va, y_va, X_te, device):
                 pred, _ = model(xb)
                 preds.append(pred.detach().float().cpu().numpy())
         va_pred = np.concatenate(preds)
-        cur_mse = mse(y_va, va_pred)
-        if cur_mse < best_mse:
-            best_mse = cur_mse
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            bad = 0
-        else:
-            bad += 1
-            if bad >= CONFIG["ADAPTER_PATIENCE"]:
-                break
-    model.load_state_dict(best_state)
+        _ = mse(y_va, va_pred)
     model.eval()
     with torch.no_grad():
         Xva_t = torch.tensor(X_va, dtype=torch.float32, device=device)
@@ -771,10 +761,9 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
             torch.tensor(sample_weight[tr_idx], dtype=torch.float32),
         ), batch_size=CONFIG["TABM_BATCH_SIZE"], shuffle=True)
         va_loader = DataLoader(TensorDataset(torch.tensor(Xva_num, dtype=torch.float32), torch.tensor(X_cat[va_idx], dtype=torch.long), torch.tensor(y[va_idx], dtype=torch.float32)), batch_size=CONFIG["TABM_BATCH_SIZE"], shuffle=False)
-        total_steps = max(1, CONFIG["TABM_EPOCHS"] * len(tr_loader))
+        total_steps = max(1, CONFIG["TabM_epoch"] * len(tr_loader))
         scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["TABM_WARMUP_RATIO"])
-        best_state, best_mse, bad = None, float("inf"), 0
-        for _ in range(CONFIG["TABM_EPOCHS"]):
+        for _ in range(CONFIG["TabM_epoch"]):
             model.train()
             for xb_num, xb_cat, yb, wb in tr_loader:
                 xb_num, xb_cat, yb, wb = xb_num.to(device), xb_cat.to(device), yb.to(device), wb.to(device)
@@ -798,16 +787,7 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
                     pred, _ = model(xb_num, xb_cat)
                     preds.append(pred.detach().float().cpu().numpy())
             va_pred = np.concatenate(preds)
-            cur_mse = mse(y[va_idx], va_pred)
-            if cur_mse < best_mse:
-                best_mse = cur_mse
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                bad = 0
-            else:
-                bad += 1
-                if bad >= CONFIG["TABM_PATIENCE"]:
-                    break
-        model.load_state_dict(best_state)
+            _ = mse(y[va_idx], va_pred)
         model.eval()
         with torch.no_grad():
             va_pred, _ = model(torch.tensor(Xva_num, dtype=torch.float32, device=device), torch.tensor(X_cat[va_idx], dtype=torch.long, device=device))
@@ -837,13 +817,11 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: 
             bagging_temperature=CONFIG["CATBOOST_BAGGING_TEMPERATURE"],
             loss_function="Lq:q=2",
             eval_metric="RMSE",
-            od_type="Iter",
-            od_wait=CONFIG["CATBOOST_OD_WAIT"],
             random_state=seed + fold,
             verbose=CONFIG["CATBOOST_VERBOSE"],
         )
         with suppress_stdout_stderr():
-            model.fit(X_train_df.iloc[tr_idx], y[tr_idx], eval_set=(X_train_df.iloc[va_idx], y[va_idx]), cat_features=cat_idx, use_best_model=True)
+            model.fit(X_train_df.iloc[tr_idx], y[tr_idx], cat_features=cat_idx)
         va_pred = model.predict(X_train_df.iloc[va_idx]).astype(np.float32)
         oof[va_idx] = va_pred
         test_pred += model.predict(X_test_df).astype(np.float32) / len(folds)
@@ -867,10 +845,16 @@ def train_lightgbm(X_train, y, X_test, folds, seed: int = 42):
         dtr = lgb.Dataset(X_train.iloc[tr_idx], label=y[tr_idx])
         dva = lgb.Dataset(X_train.iloc[va_idx], label=y[va_idx])
         with suppress_stdout_stderr():
-            model = lgb.train(params, dtr, num_boost_round=CONFIG["LIGHTGBM_NUM_ROUNDS"], valid_sets=[dva], callbacks=[lgb.early_stopping(CONFIG["LIGHTGBM_EARLY_STOPPING"], verbose=False), lgb.log_evaluation(0)])
-        va_pred = model.predict(X_train.iloc[va_idx], num_iteration=model.best_iteration).astype(np.float32)
+            model = lgb.train(
+                params,
+                dtr,
+                num_boost_round=CONFIG["LightGBM_epoch"],
+                valid_sets=[dva],
+                callbacks=[lgb.log_evaluation(0)],
+            )
+        va_pred = model.predict(X_train.iloc[va_idx]).astype(np.float32)
         oof[va_idx] = va_pred
-        test_pred += model.predict(X_test, num_iteration=model.best_iteration).astype(np.float32) / len(folds)
+        test_pred += model.predict(X_test).astype(np.float32) / len(folds)
         log_stage("LightGBM", y[va_idx], va_pred, time.time() - start)
     return oof, test_pred
 
@@ -903,8 +887,10 @@ def train_xgboost(X_train, y, X_test, folds, seed: int = 42):
         )
         with suppress_stdout_stderr():
             model = xgb.train(
-                params, dtr, num_boost_round=CONFIG["XGBOOST_NUM_ROUNDS"],
-                evals=[(dva, "va")], early_stopping_rounds=CONFIG["XGBOOST_EARLY_STOPPING"],
+                params,
+                dtr,
+                num_boost_round=CONFIG["XGBoost_epoch"],
+                evals=[(dva, "va")],
                 verbose_eval=False,
             )
         va_pred = model.predict(dva).astype(np.float32)
@@ -1360,7 +1346,7 @@ def main(args):
     log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN", "ExtraTrees", "RandomForest"]})
     try:
         full_cat_model = CatBoostRegressor(
-            iterations=CONFIG["CATBOOST_ITERATIONS"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
+            iterations=CONFIG["CatBoost_epoch"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
             l2_leaf_reg=CONFIG["CATBOOST_L2_LEAF_REG"], subsample=CONFIG["CATBOOST_SUBSAMPLE"], rsm=CONFIG["CATBOOST_RSM"],
             random_strength=CONFIG["CATBOOST_RANDOM_STRENGTH"], bagging_temperature=CONFIG["CATBOOST_BAGGING_TEMPERATURE"],
             loss_function="RMSE", eval_metric="RMSE", verbose=False, random_seed=CONFIG["RANDOM_STATE"]
