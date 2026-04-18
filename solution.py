@@ -14,11 +14,14 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import xgboost as xgb
 from catboost import CatBoostRegressor
+from scipy.optimize import minimize
 from sklearn.decomposition import PCA
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import StratifiedKFold
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 try:
@@ -39,11 +42,12 @@ CONFIG = {
     "SUPPRESS_HF_WARNINGS": True,
 
     # backbone
-    "TEXT_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
-    "TEXT_BATCH_SIZE": 64,
+    "TEXT_MODEL": "sentence-transformers/all-mpnet-base-v2",
+    "TEXT_MODEL_FALLBACK": "BAAI/bge-small-en-v1.5",
+    "TEXT_BATCH_SIZE": 32,
     "TEXT_MAX_LENGTH": 256,
     "L2_NORMALIZE_EMBEDDINGS": True,
-    "TEXT_PCA_DIM": 64,
+    "TEXT_PCA_DIM": 96,
 
     # CatBoost
     "CATBOOST_ITERATIONS": 5200,
@@ -69,10 +73,25 @@ CONFIG = {
     "LIGHTGBM_L2": 2.0,
     "LIGHTGBM_EARLY_STOPPING": 220,
 
+    # XGBoost
+    "XGBOOST_NUM_ROUNDS": 3000,
+    "XGBOOST_LEARNING_RATE": 0.03,
+    "XGBOOST_MAX_DEPTH": 5,
+    "XGBOOST_MIN_CHILD_WEIGHT": 4,
+    "XGBOOST_SUBSAMPLE": 0.75,
+    "XGBOOST_COLSAMPLE": 0.6,
+    "XGBOOST_REG_ALPHA": 0.1,
+    "XGBOOST_REG_LAMBDA": 3.0,
+    "XGBOOST_HUBER_SLOPE": 1.0,
+    "XGBOOST_EARLY_STOPPING": 200,
+
+    # KNN
+    "KNN_K": 25,
+
     # 文本残差头参数
-    "ADAPTER_HIDDEN": 320,
+    "ADAPTER_HIDDEN": 256,
     "ADAPTER_BOTTLENECK": 64,
-    "ADAPTER_EPOCHS": 34,
+    "ADAPTER_EPOCHS": 28,
     "ADAPTER_BATCH_SIZE": 256,
     "ADAPTER_LR": 1.4e-3,
     "ADAPTER_WEIGHT_DECAY": 2e-4,
@@ -81,10 +100,10 @@ CONFIG = {
     "ADAPTER_WARMUP_RATIO": 0.10,
 
     # TabM 参数
-    "TABM_HIDDEN": 192,
+    "TABM_HIDDEN": 160,
     "TABM_EMBED_DIM": 16,
-    "TABM_K": 4,
-    "TABM_EPOCHS": 60,
+    "TABM_K": 3,
+    "TABM_EPOCHS": 50,
     "TABM_BATCH_SIZE": 512,
     "TABM_LR": 4.5e-4,
     "TABM_WEIGHT_DECAY": 2.5e-4,
@@ -98,10 +117,10 @@ CONFIG = {
     "USE_HARD_SAMPLE_WEIGHT": True,
 
     # stacking 子集搜索
-    "STACK_MAX_MODELS": 5,
+    "STACK_MAX_MODELS": 6,
     "STACK_MIN_MODELS": 2,
-    "STACK_FORCE_INCLUDE": ["CatBoost", "TabM"],
-    "STACK_SOLVERS": ["nnls", "anchored_nnls", "ridge"],
+    "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],
+    "STACK_SOLVERS": ["convex", "nnls", "ridge"],
     "STACK_CORR_PENALTY": 0.0015,
     "STACK_HARD_GAIN_PENALTY": 0.0040,
     "DIAG_TOPK_FEATURES": 30,
@@ -109,6 +128,13 @@ CONFIG = {
     "STACK_HARD_GAIN_FLOOR": -0.002,
     "TABM_TEXT_AUX_DIM": 16,
     "TABM_DROP_NUM_COLS": [],
+
+    # Target encoding
+    "TE_SMOOTHING": 20.0,
+
+    # Multi-seed averaging
+    "SEED_LIST_MAIN": [42, 137, 2024],
+    "SEED_LIST_AUX": [42, 137],
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
@@ -253,8 +279,17 @@ def _l2_normalize(x: np.ndarray) -> np.ndarray:
 
 def get_hf_text_embeddings(texts: List[str], model_name: str, batch_size: int, device: str, max_length: int) -> np.ndarray:
     start = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name).to(device)
+    except Exception as e:
+        fallback = CONFIG.get("TEXT_MODEL_FALLBACK")
+        if fallback and fallback != model_name:
+            logger.warning(f"Failed to load TEXT_MODEL={model_name} ({e}); falling back to {fallback}")
+            tokenizer = AutoTokenizer.from_pretrained(fallback)
+            model = AutoModel.from_pretrained(fallback).to(device)
+        else:
+            raise
     model.eval()
     amp_enabled = device.startswith("cuda")
     all_emb = []
@@ -294,22 +329,103 @@ def fit_pca_features(train_arr: np.ndarray, test_arr: np.ndarray, n_components: 
 
 
 
+NEG_WORDS = [
+    "ominous", "hazard", "toxic", "lethal", "hostile", "dangerous", "storm",
+    "radiation", "unstable", "collapse", "contamin", "failure", "anomal",
+    "warning", "threat", "risk", "volatile", "extreme", "deadly", "corros",
+]
+POS_WORDS = [
+    "pristine", "habitable", "stable", "abundant", "mild", "temperate",
+    "breathable", "fertile", "promising", "suitable", "ideal", "rich",
+    "calm", "gentle", "lush", "thriving",
+]
+
+
+def text_keyword_features(texts: List[str]) -> np.ndarray:
+    """Hand-crafted neg/pos keyword counts + net sentiment + length features.
+    5 cols: kw_neg, kw_pos, kw_net, kw_net_ratio, kw_len."""
+    feats = np.zeros((len(texts), 5), dtype=np.float32)
+    for i, t in enumerate(texts):
+        tl = str(t).lower()
+        neg = sum(tl.count(w) for w in NEG_WORDS)
+        pos = sum(tl.count(w) for w in POS_WORDS)
+        n_words = max(len(tl.split()), 1)
+        feats[i, 0] = float(neg)
+        feats[i, 1] = float(pos)
+        feats[i, 2] = float(pos - neg)
+        feats[i, 3] = float(pos - neg) / float(n_words)
+        feats[i, 4] = float(n_words)
+    return feats
+
+
 def _safe_num(s: pd.Series, default: float = 0.0) -> pd.Series:
     out = pd.to_numeric(s, errors="coerce")
     return out.fillna(default).astype(np.float32)
 
 
-def _map_levels(s: pd.Series, mapping: Dict[str, float], default: float = 0.0) -> pd.Series:
+def _map_levels(s: pd.Series, mapping: Dict[str, float], default: float = 0.0,
+                name: Optional[str] = None, debug: bool = True) -> pd.Series:
+    miss_counter = {"n": 0, "total": 0}
     def one(x):
+        miss_counter["total"] += 1
         x = str(x).strip().lower()
         for k, v in mapping.items():
             if k in x:
                 return float(v)
+        miss_counter["n"] += 1
         return float(default)
-    return s.fillna("").map(one).astype(np.float32)
+    out = s.fillna("").map(one).astype(np.float32)
+    if debug and name is not None and miss_counter["n"] > 0:
+        logger.info(
+            f"[_map_levels] column={name:<28s} fell_to_default={miss_counter['n']}/{miss_counter['total']} "
+            f"({100.0 * miss_counter['n'] / max(1, miss_counter['total']):.2f}%) default={default}"
+        )
+    return out
 
 
-def engineer_domain_features(df_raw: pd.DataFrame) -> pd.DataFrame:
+def kfold_target_encode(series_train: pd.Series, y_train: np.ndarray, series_test: pd.Series,
+                        folds: List, smoothing: float = 20.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Out-of-fold target encoding with Bayesian smoothing. Returns (train_oof, test_full)."""
+    s_tr = series_train.astype(str).fillna("unknown").str.strip().values
+    s_te = series_test.astype(str).fillna("unknown").str.strip().values
+    y_tr = np.asarray(y_train, dtype=np.float64)
+    global_mean = float(y_tr.mean())
+    train_enc = np.full(len(s_tr), global_mean, dtype=np.float32)
+    for tr_idx, va_idx in folds:
+        grp: Dict[str, List[float]] = {}
+        for i in tr_idx:
+            grp.setdefault(s_tr[i], []).append(y_tr[i])
+        mapping: Dict[str, float] = {}
+        for k, vals in grp.items():
+            cnt = len(vals)
+            mean = float(np.mean(vals))
+            mapping[k] = (cnt * mean + smoothing * global_mean) / (cnt + smoothing)
+        for i in va_idx:
+            train_enc[i] = float(mapping.get(s_tr[i], global_mean))
+    # Full-train mapping for test
+    grp_full: Dict[str, List[float]] = {}
+    for i in range(len(s_tr)):
+        grp_full.setdefault(s_tr[i], []).append(y_tr[i])
+    full_map: Dict[str, float] = {}
+    for k, vals in grp_full.items():
+        cnt = len(vals)
+        mean = float(np.mean(vals))
+        full_map[k] = (cnt * mean + smoothing * global_mean) / (cnt + smoothing)
+    test_enc = np.array([full_map.get(k, global_mean) for k in s_te], dtype=np.float32)
+    return train_enc, test_enc
+
+
+def engineer_target_components(df_raw: pd.DataFrame, env_type_score: pd.Series) -> pd.DataFrame:
+    """Build 6 target-formula sub-scores (0-100 scale) + priors + interactions.
+
+    settlement_index ~= 0.40*H + 0.25*E + 0.15*R + 0.10*S + 0.10*Ec + 0.05*A
+      H  = environmental habitability (temperature / oxygen / gravity / pressure / day / stability / toxicity)
+      E  = environment_type target-encoded score
+      R  = resources (rare minerals, energy, water)
+      S  = safety (magnetic, radiation, seismic, storm, native biology threat)
+      Ec = economic / strategic (strategy vs terraforming+cost)
+      A  = aesthetic (albedo, cloud coverage)
+    """
     df = pd.DataFrame(index=df_raw.index)
     temp = _safe_num(df_raw.get("mean_temp_c", 0))
     oxy = _safe_num(df_raw.get("oxygen_percent", 0))
@@ -323,31 +439,110 @@ def engineer_domain_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     cost = _safe_num(df_raw.get("colonization_cost_index", 0))
     albedo = _safe_num(df_raw.get("albedo", 0.35))
     cloud = _safe_num(df_raw.get("cloud_coverage_percent", 45.0))
-    water = _map_levels(df_raw.get("water_presence", pd.Series(index=df_raw.index, dtype=object)), {"yes":1.0,"present":1.0,"abundant":1.0,"ocean":1.0,"season":0.6,"trace":0.3,"no":0.0,"none":0.0}, default=0.2)
-    energy = _map_levels(df_raw.get("energy_harvest_potential", pd.Series(index=df_raw.index, dtype=object)), {"very high":1.2,"high":1.0,"moderate":0.6,"medium":0.6,"low":0.25}, default=0.4)
-    radiation = _map_levels(df_raw.get("radiation_level", pd.Series(index=df_raw.index, dtype=object)), {"extreme":1.4,"very high":1.2,"high":1.0,"moderate":0.55,"medium":0.55,"low":0.2}, default=0.5)
-    magnetic = _map_levels(df_raw.get("magnetic_field", pd.Series(index=df_raw.index, dtype=object)), {"very strong":1.3,"strong":1.0,"moderate":0.7,"weak":0.3,"none":0.0}, default=0.4)
-    seismic = _map_levels(df_raw.get("seismic_activity", pd.Series(index=df_raw.index, dtype=object)), {"extreme":1.4,"high":1.0,"moderate":0.55,"medium":0.55,"low":0.2}, default=0.5)
-    storm = _map_levels(df_raw.get("storm_frequency", pd.Series(index=df_raw.index, dtype=object)), {"constant":1.4,"frequent":1.0,"high":1.0,"occasional":0.5,"moderate":0.5,"rare":0.15,"low":0.15}, default=0.5)
+    co2 = _safe_num(df_raw.get("co2_percent", 0))
+    ch4 = _safe_num(df_raw.get("methane_percent", 0))
 
-    habit_temp = np.exp(-np.abs(temp - 15.0) / 22.0)
-    habit_oxy = np.exp(-np.abs(oxy - 21.0) / 8.0)
-    habit_grav = np.exp(-np.abs(grav - 1.0) / 0.7)
-    habit_press = np.exp(-np.abs(press - 1.0) / 0.9)
-    habit_day = np.exp(-np.abs(day - 24.0) / 18.0)
-    habit_stability = np.exp(-np.abs(temp_range) / 40.0)
-    df["proxy_habitability"] = (0.24*habit_temp + 0.22*habit_oxy + 0.18*habit_grav + 0.14*habit_press + 0.10*habit_day + 0.12*habit_stability).astype(np.float32)
-    df["proxy_resource"] = (0.45*np.tanh(rare/50.0) + 0.30*energy + 0.25*water).astype(np.float32)
-    df["proxy_safety"] = (magnetic * np.exp(-radiation) * np.exp(-0.7*seismic) * np.exp(-0.7*storm)).astype(np.float32)
-    df["proxy_economic"] = (strategic / (1.0 + 0.6*terra + 0.4*cost)).astype(np.float32)
-    df["proxy_aesthetic"] = (np.exp(-np.abs(albedo - 0.35) / 0.25) * np.exp(-np.abs(cloud - 45.0) / 35.0)).astype(np.float32)
-    df["proxy_total_prior"] = (0.40*df["proxy_habitability"] + 0.15*df["proxy_resource"] + 0.10*df["proxy_safety"] + 0.10*df["proxy_economic"] + 0.05*df["proxy_aesthetic"]).astype(np.float32)
+    water = _map_levels(
+        df_raw.get("water_presence", pd.Series(index=df_raw.index, dtype=object)),
+        {"global ocean": 1.0, "ocean": 0.95, "seas": 0.9, "subsurface": 0.7,
+         "trace": 0.3, "ice": 0.5, "vapor": 0.4, "none": 0.0, "no": 0.0},
+        default=0.2, name="water_presence",
+    )
+    energy = _map_levels(
+        df_raw.get("energy_harvest_potential", pd.Series(index=df_raw.index, dtype=object)),
+        {"extreme": 1.3, "very high": 1.2, "high": 1.0, "moderate": 0.6,
+         "medium": 0.6, "low": 0.25, "none": 0.0},
+        default=0.4, name="energy_harvest_potential",
+    )
+    radiation = _map_levels(
+        df_raw.get("radiation_level", pd.Series(index=df_raw.index, dtype=object)),
+        {"extreme": 1.4, "very high": 1.2, "high": 1.0, "moderate": 0.55,
+         "medium": 0.55, "low": 0.2, "none": 0.0},
+        default=0.5, name="radiation_level",
+    )
+    magnetic = _map_levels(
+        df_raw.get("magnetic_field", pd.Series(index=df_raw.index, dtype=object)),
+        {"very strong": 1.3, "strong": 1.0, "moderate": 0.7, "weak": 0.3,
+         "none": 0.0, "no": 0.0},
+        default=0.5, name="magnetic_field",
+    )
+    seismic = _map_levels(
+        df_raw.get("seismic_activity", pd.Series(index=df_raw.index, dtype=object)),
+        {"extreme": 1.4, "high": 1.0, "moderate": 0.55, "medium": 0.55,
+         "low": 0.2, "none": 0.0},
+        default=0.5, name="seismic_activity",
+    )
+    storm = _map_levels(
+        df_raw.get("storm_frequency", pd.Series(index=df_raw.index, dtype=object)),
+        {"constant": 1.4, "frequent": 1.0, "high": 1.0, "seasonal": 0.6,
+         "occasional": 0.5, "moderate": 0.5, "rare": 0.15, "low": 0.15,
+         "none": 0.0},
+        default=0.5, name="storm_frequency",
+    )
+    bio_threat = _map_levels(
+        df_raw.get("native_biology", pd.Series(index=df_raw.index, dtype=object)),
+        {"complex": 1.0, "invertebrate": 0.85, "multicellular": 0.8,
+         "extremophile": 0.55, "chemosynth": 0.5, "microbial": 0.5,
+         "unknown": 0.4, "none": 0.0, "no": 0.0},
+        default=0.4, name="native_biology",
+    )
+
+    # H: two-sided Gaussian comfort zones + toxic gas damping
+    h_temp = np.exp(-((temp - 15.0) / 18.0) ** 2)
+    h_oxy = np.exp(-((oxy - 21.0) / 6.0) ** 2)
+    h_grav = np.exp(-((grav - 1.0) / 0.45) ** 2)
+    h_press = np.exp(-((press - 1.0) / 0.6) ** 2)
+    h_day = np.exp(-((day - 24.0) / 14.0) ** 2)
+    h_stab = np.exp(-(temp_range / 30.0))
+    h_toxic = np.exp(-(co2 / 20.0)) * np.exp(-(ch4 / 15.0))
+    H = 100.0 * (0.22 * h_temp + 0.20 * h_oxy + 0.18 * h_grav + 0.14 * h_press
+                 + 0.08 * h_day + 0.10 * h_stab + 0.08 * h_toxic)
+
+    # E: environment_type target encoded score (already on 0-100 scale)
+    E = np.clip(_safe_num(env_type_score, default=float(np.nanmean(env_type_score))).values, 0.0, 100.0)
+
+    # R: resources
+    R = 100.0 * (0.45 * np.tanh(rare / 60.0) + 0.30 * energy + 0.25 * water)
+
+    # S: safety
+    S = 100.0 * magnetic * np.exp(-0.6 * radiation) * np.exp(-0.5 * seismic) \
+        * np.exp(-0.5 * storm) * np.exp(-0.4 * bio_threat)
+
+    # Ec: economic (strategic / (1 + penalties))
+    Ec = 100.0 * (strategic / 10.0) / (1.0 + 0.5 * (terra / 10.0) + 0.4 * (cost / 10.0))
+
+    # A: aesthetic
+    A = 100.0 * np.exp(-((albedo - 0.35) / 0.2) ** 2) * np.exp(-((cloud - 40.0) / 30.0) ** 2)
+
+    df["comp_H"] = H.astype(np.float32)
+    df["comp_E"] = E.astype(np.float32)
+    df["comp_R"] = R.astype(np.float32)
+    df["comp_S"] = S.astype(np.float32)
+    df["comp_Ec"] = Ec.astype(np.float32)
+    df["comp_A"] = A.astype(np.float32)
+    df["prior_blend"] = (0.40 * df["comp_H"] + 0.25 * df["comp_E"] + 0.15 * df["comp_R"]
+                        + 0.10 * df["comp_S"] + 0.10 * df["comp_Ec"] + 0.05 * df["comp_A"]).astype(np.float32)
+
+    # Interactions
+    df["H_times_S"] = (df["comp_H"] * df["comp_S"] / 100.0).astype(np.float32)
+    df["H_minus_E"] = (df["comp_H"] - df["comp_E"]).astype(np.float32)
+    df["low_safety_flag"] = (df["comp_S"] < 30.0).astype(np.float32)
+    df["high_hazard_flag"] = ((radiation >= 1.0) | (seismic >= 1.0) | (storm >= 1.0)).astype(np.float32)
+
+    # Helpful legacy feature-engineering that remained predictive
     df["feat_oxygen_temp"] = (oxy * temp).astype(np.float32)
     df["feat_pressure_gravity_ratio"] = (press / (np.abs(grav) + 1e-3)).astype(np.float32)
-    df["feat_temp_water"] = (habit_temp * water).astype(np.float32)
     df["feat_magnetic_radiation_ratio"] = (magnetic / (1.0 + radiation)).astype(np.float32)
     df["feat_cost_strategy_ratio"] = (strategic / (1.0 + cost)).astype(np.float32)
-    df["feat_terraform_resource_ratio"] = (np.tanh(rare/50.0) / (1.0 + terra)).astype(np.float32)
+    df["feat_terraform_resource_ratio"] = (np.tanh(rare / 60.0) / (1.0 + terra)).astype(np.float32)
+
+    # Distribution logging for sanity check
+    for col in ["comp_H", "comp_E", "comp_R", "comp_S", "comp_Ec", "comp_A", "prior_blend"]:
+        v = df[col].values.astype(np.float64)
+        logger.info(
+            f"[TargetComp] {col:<12s} mean={v.mean():.3f} std={v.std():.3f} "
+            f"min={v.min():.3f} max={v.max():.3f}"
+        )
     return df
 
 
@@ -524,10 +719,13 @@ class TabMStyleRegressor(nn.Module):
         return pred, gate
 
 
-def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims, folds, device):
+def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims, folds, device, seed: int = 42):
     oof = np.zeros(len(X_num), dtype=np.float32)
     test_pred = np.zeros(len(X_num_test), dtype=np.float32)
     amp_enabled = device.startswith("cuda")
+    torch.manual_seed(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         scaler_num = StandardScaler()
@@ -593,7 +791,7 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
     return oof, test_pred
 
 
-def train_catboost(X_train_df, y, X_test_df, categorical_features, folds):
+def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: int = 42):
     oof = np.zeros(len(X_train_df), dtype=np.float32)
     test_pred = np.zeros(len(X_test_df), dtype=np.float32)
     cat_idx = [X_train_df.columns.get_loc(c) for c in categorical_features if c in X_train_df.columns]
@@ -612,7 +810,7 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds):
             eval_metric="RMSE",
             od_type="Iter",
             od_wait=CONFIG["CATBOOST_OD_WAIT"],
-            random_state=CONFIG["RANDOM_STATE"] + fold,
+            random_state=seed + fold,
             verbose=CONFIG["CATBOOST_VERBOSE"],
         )
         with suppress_stdout_stderr():
@@ -624,7 +822,7 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds):
     return oof, test_pred
 
 
-def train_lightgbm(X_train, y, X_test, folds):
+def train_lightgbm(X_train, y, X_test, folds, seed: int = 42):
     oof = np.zeros(len(X_train), dtype=np.float32)
     test_pred = np.zeros(len(X_test), dtype=np.float32)
     params = {
@@ -632,7 +830,7 @@ def train_lightgbm(X_train, y, X_test, folds):
         "learning_rate": CONFIG["LIGHTGBM_LEARNING_RATE"], "num_leaves": CONFIG["LIGHTGBM_NUM_LEAVES"], "max_depth": CONFIG["LIGHTGBM_MAX_DEPTH"],
         "min_child_samples": CONFIG["LIGHTGBM_MIN_CHILD_SAMPLES"], "feature_fraction": CONFIG["LIGHTGBM_COLSAMPLE"],
         "bagging_fraction": CONFIG["LIGHTGBM_SUBSAMPLE"], "bagging_freq": 1, "lambda_l1": CONFIG["LIGHTGBM_L1"],
-        "lambda_l2": CONFIG["LIGHTGBM_L2"], "verbosity": -1, "seed": CONFIG["RANDOM_STATE"], "num_threads": 0,
+        "lambda_l2": CONFIG["LIGHTGBM_L2"], "verbosity": -1, "seed": seed, "num_threads": 0,
     }
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
@@ -647,8 +845,116 @@ def train_lightgbm(X_train, y, X_test, folds):
     return oof, test_pred
 
 
+def train_xgboost(X_train, y, X_test, folds, seed: int = 42):
+    """XGBoost with pseudo-Huber loss, robust to outliers - provides distinct error patterns vs CatBoost/LightGBM."""
+    oof = np.zeros(len(X_train), dtype=np.float32)
+    test_pred = np.zeros(len(X_test), dtype=np.float32)
+    params = dict(
+        objective="reg:pseudohubererror",
+        huber_slope=CONFIG["XGBOOST_HUBER_SLOPE"],
+        eta=CONFIG["XGBOOST_LEARNING_RATE"],
+        max_depth=CONFIG["XGBOOST_MAX_DEPTH"],
+        min_child_weight=CONFIG["XGBOOST_MIN_CHILD_WEIGHT"],
+        subsample=CONFIG["XGBOOST_SUBSAMPLE"],
+        colsample_bytree=CONFIG["XGBOOST_COLSAMPLE"],
+        reg_alpha=CONFIG["XGBOOST_REG_ALPHA"],
+        reg_lambda=CONFIG["XGBOOST_REG_LAMBDA"],
+        tree_method="hist",
+        eval_metric="rmse",
+        seed=seed,
+        verbosity=0,
+    )
+    dte = xgb.DMatrix(X_test)
+    for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
+        start = time.time()
+        dtr = xgb.DMatrix(X_train.iloc[tr_idx], label=y[tr_idx])
+        dva = xgb.DMatrix(X_train.iloc[va_idx], label=y[va_idx])
+        with suppress_stdout_stderr():
+            model = xgb.train(
+                params, dtr, num_boost_round=CONFIG["XGBOOST_NUM_ROUNDS"],
+                evals=[(dva, "va")], early_stopping_rounds=CONFIG["XGBOOST_EARLY_STOPPING"],
+                verbose_eval=False,
+            )
+        va_pred = model.predict(dva).astype(np.float32)
+        oof[va_idx] = va_pred
+        test_pred += model.predict(dte).astype(np.float32) / len(folds)
+        log_stage("XGBoost", y[va_idx], va_pred, time.time() - start)
+    return oof, test_pred
+
+
+def train_knn_components(comp_train: np.ndarray, y: np.ndarray, comp_test: np.ndarray,
+                         folds: List, k: int = 25):
+    """KNN over 6 subscores + a few key raw numerics.
+       Under a synthetic-composite target KNN captures local consistency and
+       typically produces residuals weakly correlated with tree models."""
+    oof = np.zeros(len(y), dtype=np.float32)
+    test_pred = np.zeros(len(comp_test), dtype=np.float32)
+    for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
+        start = time.time()
+        sc = StandardScaler().fit(comp_train[tr_idx])
+        knn = KNeighborsRegressor(n_neighbors=k, weights="distance", n_jobs=-1)
+        knn.fit(sc.transform(comp_train[tr_idx]), y[tr_idx])
+        va_pred = knn.predict(sc.transform(comp_train[va_idx])).astype(np.float32)
+        oof[va_idx] = va_pred
+        test_pred += knn.predict(sc.transform(comp_test)).astype(np.float32) / len(folds)
+        log_stage("KNN", y[va_idx], va_pred, time.time() - start)
+    return oof, test_pred
+
+
+def train_with_seeds(train_fn, seeds: List[int], *args, **kwargs):
+    """Run a training function across multiple seeds and average OOF/test predictions."""
+    oofs: List[np.ndarray] = []
+    tests: List[np.ndarray] = []
+    for seed in seeds:
+        oof, test = train_fn(*args, seed=seed, **kwargs)
+        oofs.append(oof)
+        tests.append(test)
+    return np.mean(np.stack(oofs, axis=0), axis=0).astype(np.float32), \
+           np.mean(np.stack(tests, axis=0), axis=0).astype(np.float32)
+
+
+def convex_stack_solver(oof_matrix: np.ndarray, y: np.ndarray, test_matrix: np.ndarray):
+    """Convex combination stacking: non-negative weights that sum to 1.
+    Avoids the ±sign cancellation that RidgeCV/NNLS produce when base models
+    are highly correlated."""
+    n = oof_matrix.shape[1]
+    def loss(w):
+        w = np.clip(w, 0.0, None)
+        s = w.sum()
+        if s <= 1e-8:
+            return float("inf")
+        w = w / s
+        return float(np.mean((oof_matrix @ w - y) ** 2))
+    w0 = np.ones(n, dtype=np.float64) / n
+    res = minimize(
+        loss, w0, method="SLSQP",
+        bounds=[(0.0, 1.0)] * n,
+        constraints={"type": "eq", "fun": lambda w: w.sum() - 1.0},
+        options={"maxiter": 500, "ftol": 1e-9},
+    )
+    w = np.clip(res.x, 0.0, None)
+    s = w.sum()
+    w = w / s if s > 1e-8 else np.ones(n) / n
+    pred_tr = (oof_matrix @ w).astype(np.float32)
+    pred_te = (test_matrix @ w).astype(np.float32)
+    return pred_tr, pred_te, w.astype(np.float32), 0.0
+
+
+def quantile_align(pred_test: np.ndarray, pred_oof: np.ndarray, y_true: np.ndarray,
+                   n_q: int = 200, clip_lo: float = 0.0, clip_hi: float = 100.0) -> np.ndarray:
+    """Align pred_test's quantiles to the true-y distribution using pred_oof -> y mapping."""
+    q = np.linspace(0.0, 1.0, n_q)
+    pred_q = np.quantile(pred_oof, q)
+    true_q = np.quantile(y_true, q)
+    aligned = np.interp(pred_test, pred_q, true_q)
+    return np.clip(aligned, clip_lo, clip_hi).astype(np.float32)
+
+
 def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver_name: str,
                      anchor_tr: Optional[np.ndarray] = None, anchor_te: Optional[np.ndarray] = None):
+    if solver_name == "convex":
+        pred_tr, pred_te, coef, _ = convex_stack_solver(Xtr_s, y, Xte_s)
+        return {"pred_tr": pred_tr, "pred_te": pred_te, "coef": coef, "intercept": 0.0, "label": "ConvexStack"}
     if solver_name == "ridge":
         model = RidgeCV(alphas=np.logspace(-4, 3, 32))
         model.fit(Xtr_s, y)
@@ -746,7 +1052,12 @@ def train_stacking_subset_search(base_oof: np.ndarray, y: np.ndarray, base_test_
                 if n not in CONFIG["STACK_FORCE_INCLUDE"] and hard_gains.get(n, 0.0) < 0:
                     neg_hard_penalty += (-hard_gains[n]) * CONFIG["STACK_HARD_GAIN_PENALTY"]
             for solver_name in CONFIG["STACK_SOLVERS"]:
-                if solver_name == "anchored_nnls":
+                if solver_name == "convex":
+                    fit = fit_stack_solver(Xtr, y, Xte, solver_name)
+                    coef_map = np.zeros(len(model_names), dtype=np.float32)
+                    if fit is not None:
+                        coef_map[np.array(sel)] = fit["coef"].astype(np.float32)
+                elif solver_name == "anchored_nnls":
                     other_local = [j for j, i in enumerate(sel) if model_names[i] != "CatBoost"]
                     if len(other_local) == 0:
                         fit = {"pred_tr": ref_pred.astype(np.float32), "pred_te": base_test_preds[:, ref_idx].astype(np.float32), "coef": np.zeros(0, dtype=np.float32), "intercept": 0.0, "label": "AnchoredNNLS"}
@@ -792,13 +1103,44 @@ def main(args):
     numeric_cols, categorical_cols, text_cols = identify_columns(train_df)
 
     full_df = pd.concat([train_df, test_df], axis=0, ignore_index=True)
-    domain_df = engineer_domain_features(full_df)
-    full_proc, encoders = preprocess_tabular(full_df, numeric_cols, categorical_cols, True)
-    full_proc = pd.concat([full_proc.reset_index(drop=True), domain_df.reset_index(drop=True)], axis=1)
-    train_proc = full_proc.iloc[:len(train_df)].copy().reset_index(drop=True)
-    test_proc = full_proc.iloc[len(train_df):].copy().reset_index(drop=True)
     y = train_df["settlement_index"].values.astype(np.float32)
     folds = make_folds(y, args.n_folds, CONFIG["RANDOM_STATE"])
+
+    # K-fold target encoding for categorical columns (leak-free)
+    te_cols = [c for c in ["environment_type", "atmosphere_primary_gases", "viability_class", "dominant_biome"]
+               if c in train_df.columns]
+    te_train: Dict[str, np.ndarray] = {}
+    te_test: Dict[str, np.ndarray] = {}
+    for col in te_cols:
+        tr_enc, te_enc = kfold_target_encode(
+            train_df[col], y, test_df[col], folds, smoothing=CONFIG["TE_SMOOTHING"]
+        )
+        te_train[col] = tr_enc
+        te_test[col] = te_enc
+        logger.info(
+            f"[TargetEncode] {col:<32s} train mean={tr_enc.mean():.3f} std={tr_enc.std():.3f} | "
+            f"test mean={te_enc.mean():.3f} std={te_enc.std():.3f}"
+        )
+
+    # Environment-type score (0-100) feeds into engineer_target_components comp_E
+    if "environment_type" in te_cols:
+        env_score_full = np.concatenate([te_train["environment_type"], te_test["environment_type"]])
+    else:
+        env_score_full = np.full(len(full_df), float(y.mean()), dtype=np.float32)
+    env_score_series = pd.Series(env_score_full, index=full_df.index)
+
+    # Build target-formula feature components (6 sub-scores + prior + interactions)
+    target_comp_df = engineer_target_components(full_df, env_score_series)
+
+    full_proc, encoders = preprocess_tabular(full_df, numeric_cols, categorical_cols, True)
+    full_proc = pd.concat([full_proc.reset_index(drop=True), target_comp_df.reset_index(drop=True)], axis=1)
+    train_proc = full_proc.iloc[:len(train_df)].copy().reset_index(drop=True)
+    test_proc = full_proc.iloc[len(train_df):].copy().reset_index(drop=True)
+
+    # Splice target-encoded numeric features into train_proc / test_proc
+    for col in te_cols:
+        train_proc[f"te_{col}"] = te_train[col]
+        test_proc[f"te_{col}"] = te_test[col]
 
     train_texts = concatenate_text_fields(train_df, text_cols)
     test_texts = concatenate_text_fields(test_df, text_cols)
@@ -812,37 +1154,96 @@ def main(args):
     cat_cols = [c for c in categorical_cols if c in train_tab_df.columns]
     num_cols = [c for c in train_tab_df.columns if c not in cat_cols]
 
-    cat_oof, cat_test = train_catboost(train_tab_df, y, test_tab_df, cat_cols, folds)
-    residual_target = (y - cat_oof).astype(np.float32)
+    # Keyword-based sentiment features from raw text fields (Phase 4)
+    kw_train = text_keyword_features(train_texts)
+    kw_test = text_keyword_features(test_texts)
+    kw_cols = ["kw_neg", "kw_pos", "kw_net", "kw_net_ratio", "kw_len"]
+    for i, c in enumerate(kw_cols):
+        train_tab_df[c] = kw_train[:, i]
+        test_tab_df[c] = kw_test[:, i]
+    num_cols = [c for c in train_tab_df.columns if c not in cat_cols]
+    logger.info(f"Keyword features shape train={kw_train.shape} test={kw_test.shape}")
+
+    seeds_main = CONFIG["SEED_LIST_MAIN"]
+    seeds_aux = CONFIG["SEED_LIST_AUX"]
+
+    # --- CatBoost (multi-seed) ---
+    cat_oof, cat_test = train_with_seeds(
+        train_catboost, seeds_main,
+        X_train_df=train_tab_df, y=y, X_test_df=test_tab_df,
+        categorical_features=cat_cols, folds=folds,
+    )
+    log_prediction_diagnostics("CatBoostMS", y, cat_oof)
+
     hard_weights = compute_hard_weights(y - cat_oof) if CONFIG["USE_HARD_SAMPLE_WEIGHT"] else np.ones_like(y, dtype=np.float32)
 
-    txt_resid_oof, txt_resid_test, text_adapt_train, text_adapt_test = train_adapter_cv("TextResidual", text_low_train, residual_target, hard_weights, text_low_test, folds, args.device)
-    text_head_oof = (cat_oof + txt_resid_oof).astype(np.float32)
-    text_head_test = (cat_test + txt_resid_test).astype(np.float32)
+    # --- TextModel (independent; predicts y directly; extra keyword features concat to PCA input) ---
+    text_in_train = np.hstack([text_low_train, kw_train]).astype(np.float32)
+    text_in_test = np.hstack([text_low_test, kw_test]).astype(np.float32)
+    text_oof, text_test, text_adapt_train, text_adapt_test = train_adapter_cv(
+        "TextModel", text_in_train, y.astype(np.float32), hard_weights, text_in_test, folds, args.device
+    )
 
-    X_lgb = pd.concat([train_tab_df.reset_index(drop=True), pd.DataFrame(text_adapt_train, columns=[f"txt_adapt_{i}" for i in range(text_adapt_train.shape[1])])], axis=1)
-    X_lgb_test = pd.concat([test_tab_df.reset_index(drop=True), pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
-    lgb_oof, lgb_test = train_lightgbm(X_lgb, y, X_lgb_test, folds)
+    # --- LightGBM (multi-seed, uses text-adapter bottleneck features) ---
+    X_lgb = pd.concat([train_tab_df.reset_index(drop=True),
+                       pd.DataFrame(text_adapt_train, columns=[f"txt_adapt_{i}" for i in range(text_adapt_train.shape[1])])], axis=1)
+    X_lgb_test = pd.concat([test_tab_df.reset_index(drop=True),
+                            pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
+    lgb_oof, lgb_test = train_with_seeds(
+        train_lightgbm, seeds_aux,
+        X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
+    )
 
-    tabm_num_cols = [c for c in num_cols if c not in set(CONFIG["TABM_DROP_NUM_COLS"]) ]
+    # --- XGBoost (multi-seed, pseudo-Huber) ---
+    xgb_oof, xgb_test = train_with_seeds(
+        train_xgboost, seeds_main,
+        X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
+    )
+
+    # --- TabM (multi-seed, independent — predicts y directly) ---
+    tabm_num_cols = [c for c in num_cols if c not in set(CONFIG["TABM_DROP_NUM_COLS"])]
     text_aux_dim = min(CONFIG["TABM_TEXT_AUX_DIM"], text_low_train.shape[1])
-    X_num = np.hstack([train_tab_df[tabm_num_cols].values.astype(np.float32), text_low_train[:, :text_aux_dim].astype(np.float32)]).astype(np.float32)
-    X_num_test = np.hstack([test_tab_df[tabm_num_cols].values.astype(np.float32), text_low_test[:, :text_aux_dim].astype(np.float32)]).astype(np.float32)
+    X_num = np.hstack([
+        train_tab_df[tabm_num_cols].values.astype(np.float32),
+        text_low_train[:, :text_aux_dim].astype(np.float32),
+    ]).astype(np.float32)
+    X_num_test = np.hstack([
+        test_tab_df[tabm_num_cols].values.astype(np.float32),
+        text_low_test[:, :text_aux_dim].astype(np.float32),
+    ]).astype(np.float32)
     X_cat = train_tab_df[cat_cols].values.astype(np.int64) if cat_cols else np.zeros((len(train_tab_df), 0), dtype=np.int64)
     X_cat_test = test_tab_df[cat_cols].values.astype(np.int64) if cat_cols else np.zeros((len(test_tab_df), 0), dtype=np.int64)
     cat_dims = [len(encoders[c].classes_) for c in cat_cols]
-    tabm_resid_oof, tabm_resid_test = train_tabm(X_num, X_cat, residual_target, hard_weights, X_num_test, X_cat_test, cat_dims, folds, args.device)
-    tabm_oof = (cat_oof + tabm_resid_oof).astype(np.float32)
-    tabm_test = (cat_test + tabm_resid_test).astype(np.float32)
+    tabm_oof, tabm_test = train_with_seeds(
+        train_tabm, seeds_main,
+        X_num=X_num, X_cat=X_cat, y=y, sample_weight=hard_weights,
+        X_num_test=X_num_test, X_cat_test=X_cat_test, cat_dims=cat_dims,
+        folds=folds, device=args.device,
+    )
 
-    base_oof = np.vstack([cat_oof, lgb_oof, tabm_oof, text_head_oof]).T.astype(np.float32)
-    base_test = np.vstack([cat_test, lgb_test, tabm_test, text_head_test]).T.astype(np.float32)
-    model_names = ["CatBoost", "LightGBM", "TabM", "TextResidual"]
+    # --- KNN on 6-subscore space + key raw numerics ---
+    knn_cols = [c for c in ["comp_H", "comp_E", "comp_R", "comp_S", "comp_Ec", "comp_A",
+                            "prior_blend", "mean_temp_c", "oxygen_percent", "gravity_g", "rare_mineral_index"]
+                if c in train_tab_df.columns]
+    knn_train_mat = train_tab_df[knn_cols].values.astype(np.float32)
+    knn_test_mat = test_tab_df[knn_cols].values.astype(np.float32)
+    knn_oof, knn_test = train_knn_components(knn_train_mat, y, knn_test_mat, folds, k=CONFIG["KNN_K"])
+
+    base_oof = np.vstack([cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof]).T.astype(np.float32)
+    base_test = np.vstack([cat_test, lgb_test, xgb_test, tabm_test, text_test, knn_test]).T.astype(np.float32)
+    model_names = ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN"]
     stack_oof, stack_test, stack_coef, selected_models, stack_solver, stack_hard_gains, stack_global_gains = train_stacking_subset_search(base_oof, y, base_test, model_names)
+
+    # --- Quantile alignment on final test predictions ---
+    stack_oof_rmse_before = rmse(y, stack_oof)
+    stack_oof_aligned = quantile_align(stack_oof, stack_oof, y)
+    stack_oof_rmse_after = rmse(y, stack_oof_aligned)
+    stack_test = quantile_align(stack_test, stack_oof, y)
+    logger.info(f"[QuantileAlign] stack_oof RMSE before={stack_oof_rmse_before:.4f} | after_self_align={stack_oof_rmse_after:.4f}")
 
     logger.info("")
     logger.info("MODEL / MODALITY DIAGNOSTICS")
-    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, tabm_oof, text_head_oof, stack_oof]):
+    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, stack_oof]):
         log_prediction_diagnostics(name, y, pred)
     logger.info(f"Text PCA explained dim={CONFIG['TEXT_PCA_DIM']} | approx_signal_ratio_check=see explained variance above")
     logger.info(f"Tabular feature dim           = {train_tab_df.shape[1]}")
@@ -852,15 +1253,17 @@ def main(args):
     pred_dict = {
         "CatBoost": cat_oof,
         "LightGBM": lgb_oof,
+        "XGBoost": xgb_oof,
         "TabM": tabm_oof,
-        "TextResidual": text_head_oof,
+        "TextModel": text_oof,
+        "KNN": knn_oof,
         "StackingFinal": stack_oof,
     }
     log_hard_sample_diagnostics(y, pred_dict, cat_oof, top_frac=0.2)
     logger.info("STACK HARD-GAIN SUMMARY (vs CatBoost on hard samples)")
     for n, g in stack_hard_gains.items():
         logger.info(f"{n:<18s} hard_gain_vs_cat={g:.4f} | global_gain_vs_cat={stack_global_gains.get(n, 0.0):.4f}")
-    log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "TabM", "TextResidual"]})
+    log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN"]})
     try:
         full_cat_model = CatBoostRegressor(
             iterations=CONFIG["CATBOOST_ITERATIONS"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
@@ -879,12 +1282,12 @@ def main(args):
 
     logger.info("")
     logger.info("FINAL RESULTS")
-    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, tabm_oof, text_head_oof, stack_oof]):
+    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, stack_oof]):
         logger.info(f"{name:<18s} {rmse(y, pred):.4f}")
     logger.info("")
     logger.info("MODALITY / REGRESSOR MSE REPORT")
     base_rmse = rmse(y, cat_oof)
-    for name, pred in zip(model_names, [cat_oof, lgb_oof, tabm_oof, text_head_oof]):
+    for name, pred in zip(model_names, [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof]):
         logger.info(f"{name:<18s} MSE={mse(y, pred):.6f} | RMSE={rmse(y, pred):.4f} | gain_vs_cat={base_rmse - rmse(y, pred):.4f}")
     logger.info(f"StackingFinal       MSE={mse(y, stack_oof):.6f} | RMSE={rmse(y, stack_oof):.4f} | gain_vs_cat={base_rmse - rmse(y, stack_oof):.4f}")
     logger.info(f"STACKING CONTRIBUTION REPORT | solver={stack_solver}")
@@ -894,7 +1297,7 @@ def main(args):
     for name, coef in zip(model_names, stack_coef):
         logger.info(f"{name:<18s} coef={coef: .6f}")
     corr = np.corrcoef(base_oof.T)
-    logger.info("BASE MODEL CORRELATION (rows/cols follow CatBoost, LightGBM, TabM, TextResidual)")
+    logger.info("BASE MODEL CORRELATION (rows/cols follow " + ", ".join(model_names) + ")")
     logger.info(np.array2string(corr, precision=4, suppress_small=False))
     submission = pd.DataFrame({"id": test_df["id"], "settlement_index": stack_test})
     os.makedirs(args.output_dir, exist_ok=True)
@@ -904,7 +1307,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Conservative push line: subset-search stacking + stable CatBoost/TabM + weighted residual adapters")
+    parser = argparse.ArgumentParser(description="Settlement index stacking: target-formula features + 6 independent base models + convex stacking + quantile alignment")
     parser.add_argument("--data_dir", type=str, default=CONFIG["DATA_DIR"])
     parser.add_argument("--output_dir", type=str, default=CONFIG["OUTPUT_DIR"])
     parser.add_argument("--n_folds", type=int, default=CONFIG["N_FOLDS"])
