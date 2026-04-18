@@ -1120,11 +1120,20 @@ def main(args):
     corr = np.corrcoef(base_oof.T)
     logger.info("BASE MODEL CORRELATION (rows/cols follow CatBoost, LightGBM, TabM, TextResidual)")
     logger.info(np.array2string(corr, precision=4, suppress_small=False))
-    submission = pd.DataFrame({"id": test_df["id"], "settlement_index": stack_test})
+    submission_id_col = "planet_name" if "planet_name" in test_df.columns else "id"
+    submission = pd.DataFrame(
+        {
+            submission_id_col: test_df[submission_id_col],
+            "settlement_index": np.clip(stack_test, 0.0, 100.0),
+        }
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, "submission.csv")
     submission.to_csv(out_path, index=False)
-    logger.info(f"Submission saved to: {out_path}")
+    logger.info(
+        f"Submission saved to: {out_path} | columns={submission.columns.tolist()} | "
+        f"id_col={submission_id_col}"
+    )
 
 
 if __name__ == "__main__":
