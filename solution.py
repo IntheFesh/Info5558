@@ -20,6 +20,7 @@ from scipy.optimize import minimize
 from sklearn.decomposition import PCA
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import mean_squared_error
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -45,11 +46,11 @@ CONFIG = {
     # ========================================================================
 
     # ------ 每个模型的硬性训练轮数（无早停）------
-    "CatBoost_epoch": 3000,             # CatBoost 固定迭代数（经验最佳，5200 反而过拟合）
-    "LightGBM_epoch": 2200,             # LightGBM 固定 boosting 轮数
-    "XGBoost_epoch": 2000,              # XGBoost 固定 boosting 轮数
-    "TextModel_epoch": 20,              # TextModel / AdapterRegressor 固定训练 epoch 数
-    "TabM_epoch": 25,                   # TabM 固定训练 epoch 数
+    "CatBoost_epoch": 5500,             # CatBoost 固定迭代数
+    "LightGBM_epoch": 3200,             # LightGBM 固定 boosting 轮数
+    "XGBoost_epoch": 3200,              # XGBoost 固定 boosting 轮数
+    "TextModel_epoch": 32,              # TextModel / AdapterRegressor 固定训练 epoch 数
+    "TabM_epoch": 32,                   # TabM 固定训练 epoch 数
 
     # ------ 路径与基础设置 ------
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
@@ -102,6 +103,20 @@ CONFIG = {
     # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
     "KNN_K": 12,                        # 近邻数 k（原 25 过平滑，改小以保留局部细节）
 
+    # ------ ExtraTrees（完全随机分裂 + bagging，残差结构与 GBT 差异最大）------
+    "ET_N_ESTIMATORS": 800,             # 极度随机树数量
+    "ET_MAX_DEPTH": None,               # 不限深度（由叶子样本数控制）
+    "ET_MIN_SAMPLES_LEAF": 6,           # 叶节点最小样本数（防过拟合）
+    "ET_MAX_FEATURES": 0.6,             # 每次分裂候选特征比例
+    "ET_N_JOBS": -1,                    # 并行线程数（-1 用满 CPU）
+
+    # ------ RandomForest（best-split + bagging，与 GBT 的 greedy boosting 不同）------
+    "RF_N_ESTIMATORS": 600,             # 树数量
+    "RF_MAX_DEPTH": None,               # 不限深度
+    "RF_MIN_SAMPLES_LEAF": 4,           # 叶节点最小样本数
+    "RF_MAX_FEATURES": 0.5,             # 每次分裂候选特征比例
+    "RF_N_JOBS": -1,                    # 并行线程数
+
     # ------ 文本头（TextModel，AdapterRegressor）------
     "ADAPTER_HIDDEN": 256,              # 隐藏层维度
     "ADAPTER_BOTTLENECK": 64,           # 瓶颈层维度（兼作传给 LightGBM 的辅助特征维度）
@@ -129,7 +144,7 @@ CONFIG = {
     "USE_HARD_SAMPLE_WEIGHT": True,     # 是否启用困难样本加权（关闭则 w 恒为 1）
 
     # ------ Stacking 子集搜索（subset search）------
-    "STACK_MAX_MODELS": 6,              # 参与 stacking 的最多 base 模型数
+    "STACK_MAX_MODELS": 8,              # 参与 stacking 的最多 base 模型数（容纳 ET/RF）
     "STACK_MIN_MODELS": 2,              # 参与 stacking 的最少 base 模型数
     "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],  # 强制包含的 base 模型（搜索时不可剔除）
     "STACK_SOLVERS": ["convex", "nnls", "ridge"],    # 要尝试的 solver 列表（convex 优先）
@@ -875,6 +890,60 @@ def train_knn_components(comp_train: np.ndarray, y: np.ndarray, comp_test: np.nd
     return oof, test_pred
 
 
+def train_extratrees(X_train: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame,
+                     folds: List, seed: int = 42):
+    """ExtraTrees: fully-randomized splits + bagging. Its decision mechanism
+    (random cut points) is structurally different from greedy-best-split GBTs,
+    which typically yields residuals weakly correlated with CatBoost/LGB/XGB."""
+    oof = np.zeros(len(X_train), dtype=np.float32)
+    test_pred = np.zeros(len(X_test), dtype=np.float32)
+    X_tr_np = X_train.values.astype(np.float32)
+    X_te_np = X_test.values.astype(np.float32)
+    for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
+        start = time.time()
+        model = ExtraTreesRegressor(
+            n_estimators=CONFIG["ET_N_ESTIMATORS"],
+            max_depth=CONFIG["ET_MAX_DEPTH"],
+            min_samples_leaf=CONFIG["ET_MIN_SAMPLES_LEAF"],
+            max_features=CONFIG["ET_MAX_FEATURES"],
+            n_jobs=CONFIG["ET_N_JOBS"],
+            random_state=seed + fold,
+        )
+        model.fit(X_tr_np[tr_idx], y[tr_idx])
+        va_pred = model.predict(X_tr_np[va_idx]).astype(np.float32)
+        oof[va_idx] = va_pred
+        test_pred += model.predict(X_te_np).astype(np.float32) / len(folds)
+        log_stage("ExtraTrees", y[va_idx], va_pred, time.time() - start)
+    return oof, test_pred
+
+
+def train_randomforest(X_train: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame,
+                       folds: List, seed: int = 42):
+    """RandomForest: best-split + bagging. Complements ExtraTrees (which uses
+    random thresholds) and provides a second non-boosting tree ensemble with
+    a different bias-variance profile from gradient-boosted models."""
+    oof = np.zeros(len(X_train), dtype=np.float32)
+    test_pred = np.zeros(len(X_test), dtype=np.float32)
+    X_tr_np = X_train.values.astype(np.float32)
+    X_te_np = X_test.values.astype(np.float32)
+    for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
+        start = time.time()
+        model = RandomForestRegressor(
+            n_estimators=CONFIG["RF_N_ESTIMATORS"],
+            max_depth=CONFIG["RF_MAX_DEPTH"],
+            min_samples_leaf=CONFIG["RF_MIN_SAMPLES_LEAF"],
+            max_features=CONFIG["RF_MAX_FEATURES"],
+            n_jobs=CONFIG["RF_N_JOBS"],
+            random_state=seed + fold,
+        )
+        model.fit(X_tr_np[tr_idx], y[tr_idx])
+        va_pred = model.predict(X_tr_np[va_idx]).astype(np.float32)
+        oof[va_idx] = va_pred
+        test_pred += model.predict(X_te_np).astype(np.float32) / len(folds)
+        log_stage("RandomForest", y[va_idx], va_pred, time.time() - start)
+    return oof, test_pred
+
+
 def convex_stack_solver(oof_matrix: np.ndarray, y: np.ndarray, test_matrix: np.ndarray):
     """Convex combination stacking: non-negative weights that sum to 1.
     Avoids the ±sign cancellation that RidgeCV/NNLS produce when base models
@@ -1084,6 +1153,28 @@ def main(args):
             f"test mean={te_enc.mean():.3f} std={te_enc.std():.3f}"
         )
 
+    # Second-order interaction TE: (environment_type x atmosphere_primary_gases).
+    # Captures conditional means the single-column TEs miss, which helps relieve
+    # prior_blend's importance concentration (=37.4) and gives trees a new signal.
+    inter_pairs = [("environment_type", "atmosphere_primary_gases"),
+                   ("environment_type", "viability_class")]
+    inter_train: Dict[str, np.ndarray] = {}
+    inter_test: Dict[str, np.ndarray] = {}
+    for a, b in inter_pairs:
+        if a in train_df.columns and b in train_df.columns:
+            key_tr = train_df[a].astype(str).fillna("u") + "__" + train_df[b].astype(str).fillna("u")
+            key_te = test_df[a].astype(str).fillna("u") + "__" + test_df[b].astype(str).fillna("u")
+            tr_enc, te_enc = kfold_target_encode(
+                key_tr, y, key_te, folds, smoothing=CONFIG["TE_SMOOTHING"] * 1.5
+            )
+            name = f"te_{a}_x_{b}"
+            inter_train[name] = tr_enc
+            inter_test[name] = te_enc
+            logger.info(
+                f"[TargetEncode:Inter] {name:<40s} train mean={tr_enc.mean():.3f} std={tr_enc.std():.3f} | "
+                f"test mean={te_enc.mean():.3f} std={te_enc.std():.3f}"
+            )
+
     # Environment-type score (0-100) feeds into engineer_target_components comp_E
     if "environment_type" in te_cols:
         env_score_full = np.concatenate([te_train["environment_type"], te_test["environment_type"]])
@@ -1103,6 +1194,9 @@ def main(args):
     for col in te_cols:
         train_proc[f"te_{col}"] = te_train[col]
         test_proc[f"te_{col}"] = te_test[col]
+    for name in inter_train:
+        train_proc[name] = inter_train[name]
+        test_proc[name] = inter_test[name]
 
     train_texts = concatenate_text_fields(train_df, text_cols)
     test_texts = concatenate_text_fields(test_df, text_cols)
@@ -1180,9 +1274,13 @@ def main(args):
     knn_test_mat = test_tab_df[knn_cols].values.astype(np.float32)
     knn_oof, knn_test = train_knn_components(knn_train_mat, y, knn_test_mat, folds, k=CONFIG["KNN_K"])
 
-    base_oof = np.vstack([cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof]).T.astype(np.float32)
-    base_test = np.vstack([cat_test, lgb_test, xgb_test, tabm_test, text_test, knn_test]).T.astype(np.float32)
-    model_names = ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN"]
+    # --- ExtraTrees + RandomForest: non-boosting bagging learners for residual diversity ---
+    et_oof, et_test = train_extratrees(train_tab_df, y, test_tab_df, folds, seed=seed_base)
+    rf_oof, rf_test = train_randomforest(train_tab_df, y, test_tab_df, folds, seed=seed_base)
+
+    base_oof = np.vstack([cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, et_oof, rf_oof]).T.astype(np.float32)
+    base_test = np.vstack([cat_test, lgb_test, xgb_test, tabm_test, text_test, knn_test, et_test, rf_test]).T.astype(np.float32)
+    model_names = ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN", "ExtraTrees", "RandomForest"]
     stack_oof, stack_test, stack_coef, selected_models, stack_solver, stack_hard_gains, stack_global_gains = train_stacking_subset_search(base_oof, y, base_test, model_names)
 
     # --- Quantile alignment on final test predictions ---
@@ -1194,7 +1292,7 @@ def main(args):
 
     logger.info("")
     logger.info("MODEL / MODALITY DIAGNOSTICS")
-    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, stack_oof]):
+    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, et_oof, rf_oof, stack_oof]):
         log_prediction_diagnostics(name, y, pred)
     logger.info(f"Text PCA explained dim={CONFIG['TEXT_PCA_DIM']} | approx_signal_ratio_check=see explained variance above")
     logger.info(f"Tabular feature dim           = {train_tab_df.shape[1]}")
@@ -1208,13 +1306,15 @@ def main(args):
         "TabM": tabm_oof,
         "TextModel": text_oof,
         "KNN": knn_oof,
+        "ExtraTrees": et_oof,
+        "RandomForest": rf_oof,
         "StackingFinal": stack_oof,
     }
     log_hard_sample_diagnostics(y, pred_dict, cat_oof, top_frac=0.2)
     logger.info("STACK HARD-GAIN SUMMARY (vs CatBoost on hard samples)")
     for n, g in stack_hard_gains.items():
         logger.info(f"{n:<18s} hard_gain_vs_cat={g:.4f} | global_gain_vs_cat={stack_global_gains.get(n, 0.0):.4f}")
-    log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN"]})
+    log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN", "ExtraTrees", "RandomForest"]})
     try:
         full_cat_model = CatBoostRegressor(
             iterations=CONFIG["CatBoost_epoch"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
@@ -1233,12 +1333,12 @@ def main(args):
 
     logger.info("")
     logger.info("FINAL RESULTS")
-    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, stack_oof]):
+    for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, et_oof, rf_oof, stack_oof]):
         logger.info(f"{name:<18s} {rmse(y, pred):.4f}")
     logger.info("")
     logger.info("MODALITY / REGRESSOR MSE REPORT")
     base_rmse = rmse(y, cat_oof)
-    for name, pred in zip(model_names, [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof]):
+    for name, pred in zip(model_names, [cat_oof, lgb_oof, xgb_oof, tabm_oof, text_oof, knn_oof, et_oof, rf_oof]):
         logger.info(f"{name:<18s} MSE={mse(y, pred):.6f} | RMSE={rmse(y, pred):.4f} | gain_vs_cat={base_rmse - rmse(y, pred):.4f}")
     logger.info(f"StackingFinal       MSE={mse(y, stack_oof):.6f} | RMSE={rmse(y, stack_oof):.4f} | gain_vs_cat={base_rmse - rmse(y, stack_oof):.4f}")
     logger.info(f"STACKING CONTRIBUTION REPORT | solver={stack_solver}")
