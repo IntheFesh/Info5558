@@ -44,12 +44,12 @@ CONFIG = {
     # 备注：8000 训练样本 + 5 折 = 每折 6400 训练量，轮数为固定训练轮数
     # ========================================================================
 
-    # ------ 每个模型的硬性训练轮数（无早停）------
-    "CatBoost_epoch": 3000,             # CatBoost 固定迭代数（无早停）
-    "LightGBM_epoch": 2000,             # LightGBM 固定 boosting 轮数（无早停）
-    "XGBoost_epoch": 1500,              # XGBoost 固定 boosting 轮数（无早停）
+    # ------ 每个模型的硬性训练轮数（无早停；LR 降了对应训练轮数要补齐以免欠拟合）------
+    "CatBoost_epoch": 3500,             # CatBoost 固定迭代数（LR 0.018→0.015，多训 500 轮）
+    "LightGBM_epoch": 2500,             # LightGBM 固定 boosting 轮数（LR 0.025→0.018，补齐）
+    "XGBoost_epoch": 2000,              # XGBoost 固定 boosting 轮数（LR 0.03→0.02，补齐）
     "TextModel_epoch": 20,              # TextModel / AdapterRegressor 固定训练 epoch 数
-    "TabM_epoch": 25,                   # TabM 固定训练 epoch 数（40 有明显正偏置，降回 25）
+    "TabM_epoch": 25,                   # TabM 固定训练 epoch 数
 
     # ------ 路径与基础设置 ------
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
@@ -68,36 +68,36 @@ CONFIG = {
     "L2_NORMALIZE_EMBEDDINGS": True,    # 是否对文本向量做 L2 归一化
     "TEXT_PCA_DIM": 96,                 # 文本嵌入 PCA 降维后的维度
 
-    # ------ CatBoost（梯度提升树主力）------
-    "CATBOOST_LEARNING_RATE": 0.018,    # 学习率
+    # ------ CatBoost（梯度提升树主力，稳定性为先：小步长 + 强正则 + 低随机性）------
+    "CATBOOST_LEARNING_RATE": 0.015,    # 学习率（降一档，波动更小）
     "CATBOOST_DEPTH": 6,                # 树深度
-    "CATBOOST_L2_LEAF_REG": 16.0,       # L2 叶节点正则系数
-    "CATBOOST_SUBSAMPLE": 0.9,          # 行采样比例
+    "CATBOOST_L2_LEAF_REG": 20.0,       # L2 叶节点正则系数（加强）
+    "CATBOOST_SUBSAMPLE": 0.85,         # 行采样比例
     "CATBOOST_RSM": 0.8,                # 列采样比例（rsm = Random Subspace Method）
-    "CATBOOST_RANDOM_STRENGTH": 1.2,    # 分裂点选择随机强度
-    "CATBOOST_BAGGING_TEMPERATURE": 0.8, # Bayesian bootstrap 温度（越大越随机）
+    "CATBOOST_RANDOM_STRENGTH": 0.8,    # 分裂点选择随机强度（降低，fold 间更稳）
+    "CATBOOST_BAGGING_TEMPERATURE": 0.5, # Bayesian bootstrap 温度（降低，降方差）
     "CATBOOST_VERBOSE": 0,              # CatBoost 打印详细度（0=静默）
 
-    # ------ LightGBM（用 Huber 损失 + 较大叶子数，与 CatBoost 的 L2 拉开差异）------
+    # ------ LightGBM（Huber 损失 + 较大叶子数，与 CatBoost 解耦；配强正则抑制 fold 间波动）------
     "LIGHTGBM_OBJECTIVE": "huber",      # Huber 损失，与 CatBoost 的 L2 解耦，降低预测相关性
     "LIGHTGBM_HUBER_ALPHA": 0.9,        # Huber 的分位阈值 δ 控制
-    "LIGHTGBM_LEARNING_RATE": 0.025,    # 学习率（稍高以匹配浅树的慢收敛）
-    "LIGHTGBM_NUM_LEAVES": 63,          # 单棵树最大叶子数（放大，制造异于 CatBoost 的分裂空间）
-    "LIGHTGBM_MIN_CHILD_SAMPLES": 16,   # 叶节点最少样本数
-    "LIGHTGBM_MAX_DEPTH": -1,           # 放开最大深度限制
-    "LIGHTGBM_SUBSAMPLE": 0.8,          # 行采样比例
+    "LIGHTGBM_LEARNING_RATE": 0.018,    # 学习率（降一档，波动更小）
+    "LIGHTGBM_NUM_LEAVES": 47,          # 单棵树最大叶子数（63 偏大易抖动，降到 47）
+    "LIGHTGBM_MIN_CHILD_SAMPLES": 28,   # 叶节点最少样本数（加大，避免叶子过细）
+    "LIGHTGBM_MAX_DEPTH": 8,            # 限制最大深度（-1 无限会增加方差）
+    "LIGHTGBM_SUBSAMPLE": 0.75,         # 行采样比例
     "LIGHTGBM_COLSAMPLE": 0.7,          # 列采样比例（feature_fraction）
-    "LIGHTGBM_L1": 0.05,                # L1 正则
-    "LIGHTGBM_L2": 1.5,                 # L2 正则
+    "LIGHTGBM_L1": 0.1,                 # L1 正则（加强）
+    "LIGHTGBM_L2": 3.0,                 # L2 正则（加强）
 
-    # ------ XGBoost（pseudo-Huber 损失，给 stacking 提供鲁棒锚点）------
-    "XGBOOST_LEARNING_RATE": 0.03,      # 学习率
+    # ------ XGBoost（L2 损失，配小步长 + 强正则以稳住 fold 间方差）------
+    "XGBOOST_LEARNING_RATE": 0.02,      # 学习率（0.03 偏高，降一档更稳）
     "XGBOOST_MAX_DEPTH": 5,             # 树深度
-    "XGBOOST_MIN_CHILD_WEIGHT": 4,      # 叶节点最小 hessian 和（相当于叶节点最小样本权重）
-    "XGBOOST_SUBSAMPLE": 0.75,          # 行采样比例
-    "XGBOOST_COLSAMPLE": 0.6,           # 列采样比例
+    "XGBOOST_MIN_CHILD_WEIGHT": 6,      # 叶节点最小 hessian 和（加大，避免过拟合小叶）
+    "XGBOOST_SUBSAMPLE": 0.8,           # 行采样比例
+    "XGBOOST_COLSAMPLE": 0.7,           # 列采样比例
     "XGBOOST_REG_ALPHA": 0.1,           # L1 正则
-    "XGBOOST_REG_LAMBDA": 3.0,          # L2 正则
+    "XGBOOST_REG_LAMBDA": 5.0,          # L2 正则（加强）
 
     # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
     "KNN_K": 12,                        # 近邻数 k（原 25 过平滑，改小以保留局部细节）
@@ -106,20 +106,20 @@ CONFIG = {
     "ADAPTER_HIDDEN": 256,              # 隐藏层维度
     "ADAPTER_BOTTLENECK": 64,           # 瓶颈层维度（兼作传给 LightGBM 的辅助特征维度）
     "ADAPTER_BATCH_SIZE": 256,          # 训练 batch size
-    "ADAPTER_LR": 1.4e-3,               # AdamW 初始学习率
-    "ADAPTER_WEIGHT_DECAY": 2e-4,       # AdamW 权重衰减
+    "ADAPTER_LR": 1.0e-3,               # AdamW 初始学习率（1.4e-3 偏高，降到 1e-3 更稳）
+    "ADAPTER_WEIGHT_DECAY": 4e-4,       # AdamW 权重衰减（加强）
     "ADAPTER_AUX_WEIGHT": 0.006,        # 瓶颈层 L2 辅助损失权重（正则）
-    "ADAPTER_WARMUP_RATIO": 0.10,       # 学习率 warmup 占总 steps 比例
+    "ADAPTER_WARMUP_RATIO": 0.15,       # 学习率 warmup 占总 steps 比例（拉长，前期更稳）
 
-    # ------ TabM（MoE 风格表格网络）------
+    # ------ TabM（MoE 风格表格网络，fold 间波动最大，主要稳定化对象）------
     "TABM_HIDDEN": 160,                 # 隐藏层维度
     "TABM_EMBED_DIM": 16,               # 类别 embedding 维度上限
     "TABM_K": 3,                        # expert 分支数（MoE 的 K）
     "TABM_BATCH_SIZE": 512,             # 训练 batch size
-    "TABM_LR": 4.5e-4,                  # AdamW 初始学习率
-    "TABM_WEIGHT_DECAY": 2.5e-4,        # AdamW 权重衰减
+    "TABM_LR": 3.0e-4,                  # AdamW 初始学习率（4.5e-4 抖动大，降到 3e-4）
+    "TABM_WEIGHT_DECAY": 5e-4,          # AdamW 权重衰减（翻倍，抑制方差）
     "TABM_AUX_WEIGHT": 0.0025,          # 门控均衡辅助损失权重
-    "TABM_WARMUP_RATIO": 0.10,          # 学习率 warmup 占总 steps 比例
+    "TABM_WARMUP_RATIO": 0.20,          # 学习率 warmup 占总 steps 比例（拉长到 20%）
     "TABM_TEXT_AUX_DIM": 16,            # 拼到 TabM 数值输入的文本 PCA 前 N 维
     "TABM_DROP_NUM_COLS": [],           # TabM 需要排除的数值列名列表
 
