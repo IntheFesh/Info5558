@@ -33,35 +33,24 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
-    # ========================================================================
-    # 训练轮数总览（所有模型训练轮数的硬性规定入口，不使用任何早停机制）
-    # ------------------------------------------------------------------------
-    #   CatBoost          CatBoost_epoch
-    #   LightGBM          LightGBM_epoch
-    #   XGBoost           XGBoost_epoch
-    #   TextModel         TextModel_epoch
-    #   TabM              TabM_epoch
-    #   KNN               惰性学习，无训练轮数
-    # 备注：8000 训练样本 + 5 折 = 每折 6400 训练量，轮数为固定训练轮数
-    # ========================================================================
 
-    # ------ 每个模型的硬性训练轮数（无早停）------
+    # 每个模型的硬性训练轮数
     "CatBoost_epoch": 5000,             # CatBoost 固定迭代数
     "LightGBM_epoch": 3000,             # LightGBM 固定 boosting 轮数
     "XGBoost_epoch": 3000,              # XGBoost 固定 boosting 轮数
     "TextModel_epoch": 32,              # TextModel / AdapterRegressor 固定训练 epoch 数
     "TabM_epoch": 32,                   # TabM 固定训练 epoch 数
 
-    # ------ 路径与基础设置 ------
-    "DATA_DIR": ".",                     # 训练/测试 CSV 所在目录（默认当前目录）
-    "OUTPUT_DIR": "./result",            # 提交结果输出目录
+    # 路径与基础设置
+    "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",                    # 训练/测试 CSV 所在目录（默认当前目录）
+    "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",            # 提交结果输出目录
     "N_FOLDS": 5,                       # 交叉验证折数
-    "RANDOM_STATE": 42,                 # 全局随机种子（fold 划分、PCA、ElasticNet 用）
+    "RANDOM_STATE": 42,                 # 全局随机种子（使用范围：fold 划分、PCA、ElasticNet）
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",  # 训练设备，优先 GPU
-    "LOG_LEVEL": "INFO",                # 日志级别（DEBUG / INFO / WARNING）
+    "LOG_LEVEL": "INFO",                # 日志（DEBUG / INFO / WARNING）
     "SUPPRESS_HF_WARNINGS": True,       # 是否屏蔽 HuggingFace 和 warnings 的冗余输出
 
-    # ------ 文本编码器（HF Transformers）------
+    # 文本编码器
     "TEXT_MODEL": "sentence-transformers/all-mpnet-base-v2",   # 主文本编码器，MPNet-base 768 维
     "TEXT_MODEL_FALLBACK": "BAAI/bge-small-en-v1.5",           # 下载失败时降级模型，BGE-small 384 维
     "TEXT_BATCH_SIZE": 32,              # 文本编码推理 batch（MPNet batch=32 约占 2G 显存）
@@ -69,55 +58,55 @@ CONFIG = {
     "L2_NORMALIZE_EMBEDDINGS": True,    # 是否对文本向量做 L2 归一化
     "TEXT_PCA_DIM": 96,                 # 文本嵌入 PCA 降维后的维度
 
-    # ------ CatBoost（梯度提升树主力）------
-    "CATBOOST_LEARNING_RATE": 0.018,    # 学习率（回到经验值 0.018，LR 0.015 + 5200 epoch 反而更差）
+    # CatBoost
+    "CATBOOST_LEARNING_RATE": 0.018,    # 学习率（参考过去的数值：0.018，LR 0.015 + 5200 epoch 更差）
     "CATBOOST_DEPTH": 6,                # 树深度
-    "CATBOOST_L2_LEAF_REG": 18.0,       # L2 叶节点正则系数（中间值）
+    "CATBOOST_L2_LEAF_REG": 18.0,       # L2 叶节点正则系数
     "CATBOOST_SUBSAMPLE": 0.88,         # 行采样比例
-    "CATBOOST_RSM": 0.8,                # 列采样比例（rsm = Random Subspace Method）
-    "CATBOOST_RANDOM_STRENGTH": 1.0,    # 分裂点选择随机强度（降到 0.8 会牺牲多样性）
+    "CATBOOST_RSM": 0.8,                # 列采样比例
+    "CATBOOST_RANDOM_STRENGTH": 1.0,    # 分裂点选择随机强度
     "CATBOOST_BAGGING_TEMPERATURE": 0.7, # Bayesian bootstrap 温度
     "CATBOOST_VERBOSE": 0,              # CatBoost 打印详细度（0=静默）
 
-    # ------ LightGBM（Huber 损失：与 CatBoost L2 解耦，提供 stacker 可用的残差多样性）------
+    # LightGBM
     "LIGHTGBM_OBJECTIVE": "huber",      # Huber 损失，与 CatBoost 的 L2 解耦，降低预测相关性
     "LIGHTGBM_HUBER_ALPHA": 0.9,        # Huber 的分位阈值 δ 控制
-    "LIGHTGBM_LEARNING_RATE": 0.022,    # 学习率（回到 0.022 不欠拟合）
+    "LIGHTGBM_LEARNING_RATE": 0.022,    # 学习率
     "LIGHTGBM_NUM_LEAVES": 63,          # 单棵树最大叶子数（47 偏保守，恢复 63 保证容量）
     "LIGHTGBM_MIN_CHILD_SAMPLES": 20,   # 叶节点最少样本数
     "LIGHTGBM_MAX_DEPTH": -1,           # 不限最大深度，由 num_leaves 控制树形
     "LIGHTGBM_SUBSAMPLE": 0.75,         # 行采样比例
-    "LIGHTGBM_COLSAMPLE": 0.7,          # 列采样比例（feature_fraction）
+    "LIGHTGBM_COLSAMPLE": 0.7,          # 列采样比例
     "LIGHTGBM_L1": 0.05,                # L1 正则
     "LIGHTGBM_L2": 2.0,                 # L2 正则
 
-    # ------ XGBoost（L2 损失，配小步长 + 强正则以稳住 fold 间方差）------
-    "XGBOOST_LEARNING_RATE": 0.02,      # 学习率（0.03 偏高，降一档更稳）
+    # XGBoost
+    "XGBOOST_LEARNING_RATE": 0.02,      # 学习率
     "XGBOOST_MAX_DEPTH": 5,             # 树深度
     "XGBOOST_MIN_CHILD_WEIGHT": 6,      # 叶节点最小 hessian 和（加大，避免过拟合小叶）
     "XGBOOST_SUBSAMPLE": 0.8,           # 行采样比例
     "XGBOOST_COLSAMPLE": 0.7,           # 列采样比例
     "XGBOOST_REG_ALPHA": 0.1,           # L1 正则
-    "XGBOOST_REG_LAMBDA": 5.0,          # L2 正则（加强）
+    "XGBOOST_REG_LAMBDA": 5.0,          # L2 正则
 
-    # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
-    "KNN_K": 12,                        # 近邻数 k（原 25 过平滑，改小以保留局部细节）
+    # KNN
+    "KNN_K": 12,                        # 近邻数 k
 
-    # ------ ExtraTrees（完全随机分裂 + bagging，残差结构与 GBT 差异最大）------
+    # ExtraTrees
     "ET_N_ESTIMATORS": 800,             # 极度随机树数量
     "ET_MAX_DEPTH": None,               # 不限深度（由叶子样本数控制）
     "ET_MIN_SAMPLES_LEAF": 6,           # 叶节点最小样本数（防过拟合）
     "ET_MAX_FEATURES": 0.6,             # 每次分裂候选特征比例
     "ET_N_JOBS": -1,                    # 并行线程数（-1 用满 CPU）
 
-    # ------ RandomForest（best-split + bagging，与 GBT 的 greedy boosting 不同）------
+    # RandomForest
     "RF_N_ESTIMATORS": 600,             # 树数量
     "RF_MAX_DEPTH": None,               # 不限深度
     "RF_MIN_SAMPLES_LEAF": 4,           # 叶节点最小样本数
     "RF_MAX_FEATURES": 0.5,             # 每次分裂候选特征比例
     "RF_N_JOBS": -1,                    # 并行线程数
 
-    # ------ 文本头（TextModel，AdapterRegressor）------
+    # 文本头
     "ADAPTER_HIDDEN": 256,              # 隐藏层维度
     "ADAPTER_BOTTLENECK": 64,           # 瓶颈层维度（兼作传给 LightGBM 的辅助特征维度）
     "ADAPTER_BATCH_SIZE": 256,          # 训练 batch size
@@ -126,24 +115,24 @@ CONFIG = {
     "ADAPTER_AUX_WEIGHT": 0.006,        # 瓶颈层 L2 辅助损失权重（正则）
     "ADAPTER_WARMUP_RATIO": 0.10,       # 学习率 warmup 占总 steps 比例
 
-    # ------ TabM（MoE 风格表格网络，需要足够的学习率与容量才能贡献多样性）------
+    # TabM
     "TABM_HIDDEN": 160,                 # 隐藏层维度
     "TABM_EMBED_DIM": 16,               # 类别 embedding 维度上限
     "TABM_K": 3,                        # expert 分支数（MoE 的 K）
     "TABM_BATCH_SIZE": 512,             # 训练 batch size
-    "TABM_LR": 4.5e-4,                  # AdamW 初始学习率（3e-4 + 25 epoch 欠拟合 RMSE 7.7）
+    "TABM_LR": 4.5e-4,                  # AdamW 初始学习率
     "TABM_WEIGHT_DECAY": 2.5e-4,        # AdamW 权重衰减
     "TABM_AUX_WEIGHT": 0.0025,          # 门控均衡辅助损失权重
     "TABM_WARMUP_RATIO": 0.10,          # 学习率 warmup 占总 steps 比例
     "TABM_TEXT_AUX_DIM": 16,            # 拼到 TabM 数值输入的文本 PCA 前 N 维
     "TABM_DROP_NUM_COLS": [],           # TabM 需要排除的数值列名列表
 
-    # ------ 困难样本加权 ------
+    # 困难样本加权
     "HARD_WEIGHT_ALPHA": 2.0,           # 困难样本权重上限的增益系数（w = 1 + α·pct^β）
     "HARD_WEIGHT_POWER": 2.0,           # 困难程度百分位的幂次 β
     "USE_HARD_SAMPLE_WEIGHT": True,     # 是否启用困难样本加权（关闭则 w 恒为 1）
 
-    # ------ Stacking 子集搜索（subset search）------
+    # Stacking subset search
     "STACK_MAX_MODELS": 8,              # 参与 stacking 的最多 base 模型数（容纳 ET/RF）
     "STACK_MIN_MODELS": 2,              # 参与 stacking 的最少 base 模型数
     "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],  # 强制包含的 base 模型（搜索时不可剔除）
@@ -157,11 +146,8 @@ CONFIG = {
     "STACK_HARD_GAIN_FLOOR": -5.0,      # 困难样本 gain 下界（放宽：同上）
     "DIAG_TOPK_FEATURES": 30,           # CatBoost feature importance 打印前 K 项
 
-    # ------ 目标编码（Target Encoding）------
+    # 目标编码
     "TE_SMOOTHING": 20.0,               # Bayesian smoothing 系数（越大越偏向全局均值）
-
-    # ------ 单种子训练（不做多-seed 平均）------
-    # 所有模型复用 RANDOM_STATE 作为 seed，单次训练完成。
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
@@ -1251,7 +1237,7 @@ def main(args):
 
     seed_base = CONFIG["RANDOM_STATE"]
 
-    # --- CatBoost (single-seed, fixed iterations, no early stop) ---
+    # CatBoost (single-seed, fixed iterations, no early stop)
     cat_oof, cat_test = train_catboost(
         train_tab_df, y, test_tab_df, cat_cols, folds, seed=seed_base,
     )
@@ -1259,24 +1245,24 @@ def main(args):
 
     hard_weights = compute_hard_weights(y - cat_oof) if CONFIG["USE_HARD_SAMPLE_WEIGHT"] else np.ones_like(y, dtype=np.float32)
 
-    # --- TextModel (independent; predicts y directly; extra keyword features concat to PCA input) ---
+    # TextModel (independent; predicts y directly; extra keyword features concat to PCA input)
     text_in_train = np.hstack([text_low_train, kw_train]).astype(np.float32)
     text_in_test = np.hstack([text_low_test, kw_test]).astype(np.float32)
     text_oof, text_test, text_adapt_train, text_adapt_test = train_adapter_cv(
         "TextModel", text_in_train, y.astype(np.float32), hard_weights, text_in_test, folds, args.device
     )
 
-    # --- LightGBM (single-seed, uses text-adapter bottleneck features) ---
+    # LightGBM (single-seed, uses text-adapter bottleneck features)
     X_lgb = pd.concat([train_tab_df.reset_index(drop=True),
                        pd.DataFrame(text_adapt_train, columns=[f"txt_adapt_{i}" for i in range(text_adapt_train.shape[1])])], axis=1)
     X_lgb_test = pd.concat([test_tab_df.reset_index(drop=True),
                             pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
     lgb_oof, lgb_test = train_lightgbm(X_lgb, y, X_lgb_test, folds, seed=seed_base)
 
-    # --- XGBoost (single-seed, squared-error) ---
+    # (single-seed, squared-error)
     xgb_oof, xgb_test = train_xgboost(X_lgb, y, X_lgb_test, folds, seed=seed_base)
 
-    # --- TabM (single-seed, independent — predicts y directly) ---
+    # TabM (single-seed, independent — predicts y directly)
     tabm_num_cols = [c for c in num_cols if c not in set(CONFIG["TABM_DROP_NUM_COLS"])]
     text_aux_dim = min(CONFIG["TABM_TEXT_AUX_DIM"], text_low_train.shape[1])
     X_num = np.hstack([
@@ -1295,7 +1281,7 @@ def main(args):
         folds, args.device, seed=seed_base,
     )
 
-    # --- KNN on 6-subscore space + key raw numerics ---
+    #KNN on 6-subscore space + key raw numerics
     knn_cols = [c for c in ["comp_H", "comp_E", "comp_R", "comp_S", "comp_Ec", "comp_A",
                             "prior_blend", "mean_temp_c", "oxygen_percent", "gravity_g", "rare_mineral_index"]
                 if c in train_tab_df.columns]
@@ -1303,7 +1289,7 @@ def main(args):
     knn_test_mat = test_tab_df[knn_cols].values.astype(np.float32)
     knn_oof, knn_test = train_knn_components(knn_train_mat, y, knn_test_mat, folds, k=CONFIG["KNN_K"])
 
-    # --- ExtraTrees + RandomForest: non-boosting bagging learners for residual diversity ---
+    # ExtraTrees + RandomForest: non-boosting bagging learners for residual diversity
     et_oof, et_test = train_extratrees(train_tab_df, y, test_tab_df, folds, seed=seed_base)
     rf_oof, rf_test = train_randomforest(train_tab_df, y, test_tab_df, folds, seed=seed_base)
 
@@ -1312,7 +1298,7 @@ def main(args):
     model_names = ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN", "ExtraTrees", "RandomForest"]
     stack_oof, stack_test, stack_coef, selected_models, stack_solver, stack_hard_gains, stack_global_gains = train_stacking_subset_search(base_oof, y, base_test, model_names)
 
-    # --- Quantile alignment on final test predictions ---
+    #Quantile alignment on final test predictions
     stack_oof_rmse_before = rmse(y, stack_oof)
     stack_oof_aligned = quantile_align(stack_oof, stack_oof, y)
     stack_oof_rmse_after = rmse(y, stack_oof_aligned)
