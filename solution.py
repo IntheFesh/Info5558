@@ -48,8 +48,8 @@ CONFIG = {
     "CatBoost_epoch": 3000,             # CatBoost 固定迭代数（无早停）
     "LightGBM_epoch": 2000,             # LightGBM 固定 boosting 轮数（无早停）
     "XGBoost_epoch": 1500,              # XGBoost 固定 boosting 轮数（无早停）
-    "TextModel_epoch": 25,              # TextModel / AdapterRegressor 固定训练 epoch 数
-    "TabM_epoch": 40,                   # TabM 固定训练 epoch 数
+    "TextModel_epoch": 20,              # TextModel / AdapterRegressor 固定训练 epoch 数
+    "TabM_epoch": 25,                   # TabM 固定训练 epoch 数（40 有明显正偏置，降回 25）
 
     # ------ 路径与基础设置 ------
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
@@ -78,15 +78,17 @@ CONFIG = {
     "CATBOOST_BAGGING_TEMPERATURE": 0.8, # Bayesian bootstrap 温度（越大越随机）
     "CATBOOST_VERBOSE": 0,              # CatBoost 打印详细度（0=静默）
 
-    # ------ LightGBM（树结构多样性来源之一）------
-    "LIGHTGBM_LEARNING_RATE": 0.018,    # 学习率
-    "LIGHTGBM_NUM_LEAVES": 23,          # 单棵树最大叶子数（防过拟合用小值）
-    "LIGHTGBM_MIN_CHILD_SAMPLES": 28,   # 叶节点最少样本数
-    "LIGHTGBM_MAX_DEPTH": 4,            # 最大树深度（与 num_leaves 共同约束）
-    "LIGHTGBM_SUBSAMPLE": 0.85,         # 行采样比例
-    "LIGHTGBM_COLSAMPLE": 0.72,         # 列采样比例（feature_fraction）
-    "LIGHTGBM_L1": 0.02,                # L1 正则
-    "LIGHTGBM_L2": 2.0,                 # L2 正则
+    # ------ LightGBM（用 Huber 损失 + 较大叶子数，与 CatBoost 的 L2 拉开差异）------
+    "LIGHTGBM_OBJECTIVE": "huber",      # Huber 损失，与 CatBoost 的 L2 解耦，降低预测相关性
+    "LIGHTGBM_HUBER_ALPHA": 0.9,        # Huber 的分位阈值 δ 控制
+    "LIGHTGBM_LEARNING_RATE": 0.025,    # 学习率（稍高以匹配浅树的慢收敛）
+    "LIGHTGBM_NUM_LEAVES": 63,          # 单棵树最大叶子数（放大，制造异于 CatBoost 的分裂空间）
+    "LIGHTGBM_MIN_CHILD_SAMPLES": 16,   # 叶节点最少样本数
+    "LIGHTGBM_MAX_DEPTH": -1,           # 放开最大深度限制
+    "LIGHTGBM_SUBSAMPLE": 0.8,          # 行采样比例
+    "LIGHTGBM_COLSAMPLE": 0.7,          # 列采样比例（feature_fraction）
+    "LIGHTGBM_L1": 0.05,                # L1 正则
+    "LIGHTGBM_L2": 1.5,                 # L2 正则
 
     # ------ XGBoost（pseudo-Huber 损失，给 stacking 提供鲁棒锚点）------
     "XGBOOST_LEARNING_RATE": 0.03,      # 学习率
@@ -96,10 +98,9 @@ CONFIG = {
     "XGBOOST_COLSAMPLE": 0.6,           # 列采样比例
     "XGBOOST_REG_ALPHA": 0.1,           # L1 正则
     "XGBOOST_REG_LAMBDA": 3.0,          # L2 正则
-    "XGBOOST_HUBER_SLOPE": 1.0,         # pseudo-Huber 损失转折点（δ）
 
     # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
-    "KNN_K": 25,                        # 近邻数 k
+    "KNN_K": 12,                        # 近邻数 k（原 25 过平滑，改小以保留局部细节）
 
     # ------ 文本头（TextModel，AdapterRegressor）------
     "ADAPTER_HIDDEN": 256,              # 隐藏层维度
@@ -137,16 +138,15 @@ CONFIG = {
     "STACK_RIDGE_ALPHAS_COUNT": 32,     # RidgeCV alpha 网格大小
     "STACK_CORR_PENALTY": 0.0015,       # 子集残差相关度惩罚系数（越大越偏爱多样性）
     "STACK_HARD_GAIN_PENALTY": 0.0040,  # 子集内负向 hard_gain 的惩罚系数
-    "STACK_GLOBAL_GAIN_FLOOR": -0.010,  # 可选入 stacking 的全局 gain 下界
-    "STACK_HARD_GAIN_FLOOR": -0.002,    # 可选入 stacking 的困难样本 gain 下界
+    "STACK_GLOBAL_GAIN_FLOOR": -5.0,    # 全局 gain 下界（放宽：让 LightGBM/TabM/KNN 都能进候选池）
+    "STACK_HARD_GAIN_FLOOR": -5.0,      # 困难样本 gain 下界（放宽：同上）
     "DIAG_TOPK_FEATURES": 30,           # CatBoost feature importance 打印前 K 项
 
     # ------ 目标编码（Target Encoding）------
     "TE_SMOOTHING": 20.0,               # Bayesian smoothing 系数（越大越偏向全局均值）
 
-    # ------ 多种子平均（无早停，训练完所有 seed）------
-    "SEED_LIST_MAIN": [42, 137, 2024],  # CatBoost / XGBoost / TabM 的 seed 列表
-    "SEED_LIST_AUX": [42, 137],         # LightGBM 的 seed 列表
+    # ------ 单种子训练（不做多-seed 平均）------
+    # 所有模型复用 RANDOM_STATE 作为 seed，单次训练完成。
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
@@ -513,15 +513,17 @@ def engineer_target_components(df_raw: pd.DataFrame, env_type_score: pd.Series) 
     # E: environment_type target encoded score (already on 0-100 scale)
     E = np.clip(_safe_num(env_type_score, default=float(np.nanmean(env_type_score))).values, 0.0, 100.0)
 
-    # R: resources
+    # R: resources，裁剪到 [0,100]
     R = 100.0 * (0.45 * np.tanh(rare / 60.0) + 0.30 * energy + 0.25 * water)
+    R = np.clip(R, 0.0, 100.0)
 
     # S: safety
     S = 100.0 * magnetic * np.exp(-0.6 * radiation) * np.exp(-0.5 * seismic) \
         * np.exp(-0.5 * storm) * np.exp(-0.4 * bio_threat)
 
-    # Ec: economic (strategic / (1 + penalties))
+    # Ec: economic (strategic / (1 + penalties))，裁剪到 [0,100] 与其他 comp_* 同量纲
     Ec = 100.0 * (strategic / 10.0) / (1.0 + 0.5 * (terra / 10.0) + 0.4 * (cost / 10.0))
+    Ec = np.clip(Ec, 0.0, 100.0)
 
     # A: aesthetic
     A = 100.0 * np.exp(-((albedo - 0.35) / 0.2) ** 2) * np.exp(-((cloud - 40.0) / 30.0) ** 2)
@@ -797,7 +799,8 @@ def train_lightgbm(X_train, y, X_test, folds, seed: int = 42):
     oof = np.zeros(len(X_train), dtype=np.float32)
     test_pred = np.zeros(len(X_test), dtype=np.float32)
     params = {
-        "objective": "regression_l2", "metric": "l2", "boosting_type": "gbdt",
+        "objective": CONFIG["LIGHTGBM_OBJECTIVE"], "alpha": CONFIG["LIGHTGBM_HUBER_ALPHA"],
+        "metric": "l2", "boosting_type": "gbdt",
         "learning_rate": CONFIG["LIGHTGBM_LEARNING_RATE"], "num_leaves": CONFIG["LIGHTGBM_NUM_LEAVES"], "max_depth": CONFIG["LIGHTGBM_MAX_DEPTH"],
         "min_child_samples": CONFIG["LIGHTGBM_MIN_CHILD_SAMPLES"], "feature_fraction": CONFIG["LIGHTGBM_COLSAMPLE"],
         "bagging_fraction": CONFIG["LIGHTGBM_SUBSAMPLE"], "bagging_freq": 1, "lambda_l1": CONFIG["LIGHTGBM_L1"],
@@ -816,29 +819,31 @@ def train_lightgbm(X_train, y, X_test, folds, seed: int = 42):
 
 
 def train_xgboost(X_train, y, X_test, folds, seed: int = 42):
-    """XGBoost with pseudo-Huber loss, robust to outliers - provides distinct error patterns vs CatBoost/LightGBM."""
+    """XGBoost with standard squared-error loss. Provides a gradient-boosting
+    variant distinct enough from CatBoost/LightGBM via different split rules
+    and tree growth, while staying numerically stable."""
     oof = np.zeros(len(X_train), dtype=np.float32)
     test_pred = np.zeros(len(X_test), dtype=np.float32)
-    params = dict(
-        objective="reg:pseudohubererror",
-        huber_slope=CONFIG["XGBOOST_HUBER_SLOPE"],
-        eta=CONFIG["XGBOOST_LEARNING_RATE"],
-        max_depth=CONFIG["XGBOOST_MAX_DEPTH"],
-        min_child_weight=CONFIG["XGBOOST_MIN_CHILD_WEIGHT"],
-        subsample=CONFIG["XGBOOST_SUBSAMPLE"],
-        colsample_bytree=CONFIG["XGBOOST_COLSAMPLE"],
-        reg_alpha=CONFIG["XGBOOST_REG_ALPHA"],
-        reg_lambda=CONFIG["XGBOOST_REG_LAMBDA"],
-        tree_method="hist",
-        eval_metric="rmse",
-        seed=seed,
-        verbosity=0,
-    )
     dte = xgb.DMatrix(X_test)
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         dtr = xgb.DMatrix(X_train.iloc[tr_idx], label=y[tr_idx])
         dva = xgb.DMatrix(X_train.iloc[va_idx], label=y[va_idx])
+        params = dict(
+            objective="reg:squarederror",
+            eta=CONFIG["XGBOOST_LEARNING_RATE"],
+            max_depth=CONFIG["XGBOOST_MAX_DEPTH"],
+            min_child_weight=CONFIG["XGBOOST_MIN_CHILD_WEIGHT"],
+            subsample=CONFIG["XGBOOST_SUBSAMPLE"],
+            colsample_bytree=CONFIG["XGBOOST_COLSAMPLE"],
+            reg_alpha=CONFIG["XGBOOST_REG_ALPHA"],
+            reg_lambda=CONFIG["XGBOOST_REG_LAMBDA"],
+            tree_method="hist",
+            eval_metric="rmse",
+            seed=seed + fold,
+            base_score=float(np.mean(y[tr_idx])),
+            verbosity=0,
+        )
         with suppress_stdout_stderr():
             model = xgb.train(
                 params, dtr, num_boost_round=CONFIG["XGBoost_epoch"],
@@ -868,24 +873,6 @@ def train_knn_components(comp_train: np.ndarray, y: np.ndarray, comp_test: np.nd
         test_pred += knn.predict(sc.transform(comp_test)).astype(np.float32) / len(folds)
         log_stage("KNN", y[va_idx], va_pred, time.time() - start)
     return oof, test_pred
-
-
-def train_with_seeds(train_fn, seeds: List[int], *args,
-                     label: Optional[str] = None,
-                     **kwargs):
-    """Run a training function across all provided seeds and average predictions."""
-    label = label or getattr(train_fn, "__name__", "train_fn")
-    oofs: List[np.ndarray] = []
-    tests: List[np.ndarray] = []
-    for seed in seeds:
-        t0 = time.time()
-        oof, test = train_fn(*args, seed=seed, **kwargs)
-        oofs.append(oof)
-        tests.append(test)
-        logger.info(f"[MultiSeed] {label} seed={seed} done "
-                    f"(seeds={len(oofs)}/{len(seeds)}, time={time.time()-t0:.1f}s)")
-    return np.mean(np.stack(oofs, axis=0), axis=0).astype(np.float32), \
-           np.mean(np.stack(tests, axis=0), axis=0).astype(np.float32)
 
 
 def convex_stack_solver(oof_matrix: np.ndarray, y: np.ndarray, test_matrix: np.ndarray):
@@ -1139,17 +1126,13 @@ def main(args):
     num_cols = [c for c in train_tab_df.columns if c not in cat_cols]
     logger.info(f"Keyword features shape train={kw_train.shape} test={kw_test.shape}")
 
-    seeds_main = CONFIG["SEED_LIST_MAIN"]
-    seeds_aux = CONFIG["SEED_LIST_AUX"]
+    seed_base = CONFIG["RANDOM_STATE"]
 
-    # --- CatBoost (multi-seed, fixed iterations, no early stop) ---
-    cat_oof, cat_test = train_with_seeds(
-        train_catboost, seeds_main,
-        label="CatBoost",
-        X_train_df=train_tab_df, y=y, X_test_df=test_tab_df,
-        categorical_features=cat_cols, folds=folds,
+    # --- CatBoost (single-seed, fixed iterations, no early stop) ---
+    cat_oof, cat_test = train_catboost(
+        train_tab_df, y, test_tab_df, cat_cols, folds, seed=seed_base,
     )
-    log_prediction_diagnostics("CatBoostMS", y, cat_oof)
+    log_prediction_diagnostics("CatBoost", y, cat_oof)
 
     hard_weights = compute_hard_weights(y - cat_oof) if CONFIG["USE_HARD_SAMPLE_WEIGHT"] else np.ones_like(y, dtype=np.float32)
 
@@ -1160,25 +1143,17 @@ def main(args):
         "TextModel", text_in_train, y.astype(np.float32), hard_weights, text_in_test, folds, args.device
     )
 
-    # --- LightGBM (multi-seed, uses text-adapter bottleneck features) ---
+    # --- LightGBM (single-seed, uses text-adapter bottleneck features) ---
     X_lgb = pd.concat([train_tab_df.reset_index(drop=True),
                        pd.DataFrame(text_adapt_train, columns=[f"txt_adapt_{i}" for i in range(text_adapt_train.shape[1])])], axis=1)
     X_lgb_test = pd.concat([test_tab_df.reset_index(drop=True),
                             pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
-    lgb_oof, lgb_test = train_with_seeds(
-        train_lightgbm, seeds_aux,
-        label="LightGBM",
-        X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
-    )
+    lgb_oof, lgb_test = train_lightgbm(X_lgb, y, X_lgb_test, folds, seed=seed_base)
 
-    # --- XGBoost (multi-seed, pseudo-Huber) ---
-    xgb_oof, xgb_test = train_with_seeds(
-        train_xgboost, seeds_main,
-        label="XGBoost",
-        X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
-    )
+    # --- XGBoost (single-seed, squared-error) ---
+    xgb_oof, xgb_test = train_xgboost(X_lgb, y, X_lgb_test, folds, seed=seed_base)
 
-    # --- TabM (multi-seed, independent — predicts y directly) ---
+    # --- TabM (single-seed, independent — predicts y directly) ---
     tabm_num_cols = [c for c in num_cols if c not in set(CONFIG["TABM_DROP_NUM_COLS"])]
     text_aux_dim = min(CONFIG["TABM_TEXT_AUX_DIM"], text_low_train.shape[1])
     X_num = np.hstack([
@@ -1192,12 +1167,9 @@ def main(args):
     X_cat = train_tab_df[cat_cols].values.astype(np.int64) if cat_cols else np.zeros((len(train_tab_df), 0), dtype=np.int64)
     X_cat_test = test_tab_df[cat_cols].values.astype(np.int64) if cat_cols else np.zeros((len(test_tab_df), 0), dtype=np.int64)
     cat_dims = [len(encoders[c].classes_) for c in cat_cols]
-    tabm_oof, tabm_test = train_with_seeds(
-        train_tabm, seeds_main,
-        label="TabM",
-        X_num=X_num, X_cat=X_cat, y=y, sample_weight=hard_weights,
-        X_num_test=X_num_test, X_cat_test=X_cat_test, cat_dims=cat_dims,
-        folds=folds, device=args.device,
+    tabm_oof, tabm_test = train_tabm(
+        X_num, X_cat, y, hard_weights, X_num_test, X_cat_test, cat_dims,
+        folds, args.device, seed=seed_base,
     )
 
     # --- KNN on 6-subscore space + key raw numerics ---
