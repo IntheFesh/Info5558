@@ -32,121 +32,109 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
-    # ========================================================================
-    # 训练轮数总览（所有模型训练轮数的硬性规定入口，不使用任何早停机制）
-    # ------------------------------------------------------------------------
-    #   CatBoost          CatBoost_epoch
-    #   LightGBM          LightGBM_epoch
-    #   XGBoost           XGBoost_epoch
-    #   TextModel         TextModel_epoch
-    #   TabM              TabM_epoch
-    #   KNN               惰性学习，无训练轮数
-    # 备注：8000 训练样本 + 5 折 = 每折 6400 训练量，轮数为固定训练轮数
-    # ========================================================================
+    # 路径与基础设置
+    "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",
+    "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",
+    "N_FOLDS": 5,
+    "RANDOM_STATE": 42,
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
+    "LOG_LEVEL": "INFO",
+    "SUPPRESS_HF_WARNINGS": True,
 
-    # ------ 每个模型的硬性训练轮数（无早停）------
-    "CatBoost_epoch": 3000,             # CatBoost 固定迭代数（无早停）
-    "LightGBM_epoch": 2000,             # LightGBM 固定 boosting 轮数（无早停）
-    "XGBoost_epoch": 1500,              # XGBoost 固定 boosting 轮数（无早停）
-    "TextModel_epoch": 25,              # TextModel / AdapterRegressor 固定训练 epoch 数
-    "TabM_epoch": 40,                   # TabM 固定训练 epoch 数
+    # backbone
+    "TEXT_MODEL": "sentence-transformers/all-mpnet-base-v2",
+    "TEXT_MODEL_FALLBACK": "BAAI/bge-small-en-v1.5",
+    "TEXT_BATCH_SIZE": 32,
+    "TEXT_MAX_LENGTH": 256,
+    "L2_NORMALIZE_EMBEDDINGS": True,
+    "TEXT_PCA_DIM": 96,
 
-    # ------ 路径与基础设置 ------
-    "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
-    "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",  # 提交结果输出目录
-    "N_FOLDS": 5,                       # 交叉验证折数
-    "RANDOM_STATE": 42,                 # 全局随机种子（fold 划分、PCA、ElasticNet 用）
-    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",  # 训练设备，优先 GPU
-    "LOG_LEVEL": "INFO",                # 日志级别（DEBUG / INFO / WARNING）
-    "SUPPRESS_HF_WARNINGS": True,       # 是否屏蔽 HuggingFace 和 warnings 的冗余输出
+    # CatBoost
+    "CATBOOST_ITERATIONS": 5200,
+    "CATBOOST_LEARNING_RATE": 0.012,
+    "CATBOOST_DEPTH": 6,
+    "CATBOOST_L2_LEAF_REG": 16.0,
+    "CATBOOST_SUBSAMPLE": 0.9,
+    "CATBOOST_RSM": 0.8,
+    "CATBOOST_RANDOM_STRENGTH": 1.2,
+    "CATBOOST_BAGGING_TEMPERATURE": 0.8,
+    "CATBOOST_OD_WAIT": 350,
+    "CATBOOST_VERBOSE": 0,
 
-    # ------ 文本编码器（HF Transformers）------
-    "TEXT_MODEL": "sentence-transformers/all-mpnet-base-v2",   # 主文本编码器，MPNet-base 768 维
-    "TEXT_MODEL_FALLBACK": "BAAI/bge-small-en-v1.5",           # 下载失败时降级模型，BGE-small 384 维
-    "TEXT_BATCH_SIZE": 32,              # 文本编码推理 batch（MPNet batch=32 约占 2G 显存）
-    "TEXT_MAX_LENGTH": 256,             # tokenizer 最大截断长度
-    "L2_NORMALIZE_EMBEDDINGS": True,    # 是否对文本向量做 L2 归一化
-    "TEXT_PCA_DIM": 96,                 # 文本嵌入 PCA 降维后的维度
+    # LightGBM
+    "LIGHTGBM_NUM_ROUNDS": 3200,
+    "LIGHTGBM_LEARNING_RATE": 0.018,
+    "LIGHTGBM_NUM_LEAVES": 23,
+    "LIGHTGBM_MIN_CHILD_SAMPLES": 28,
+    "LIGHTGBM_MAX_DEPTH": 4,
+    "LIGHTGBM_SUBSAMPLE": 0.85,
+    "LIGHTGBM_COLSAMPLE": 0.72,
+    "LIGHTGBM_L1": 0.02,
+    "LIGHTGBM_L2": 2.0,
+    "LIGHTGBM_EARLY_STOPPING": 220,
 
-    # ------ CatBoost（梯度提升树主力）------
-    "CATBOOST_LEARNING_RATE": 0.018,    # 学习率
-    "CATBOOST_DEPTH": 6,                # 树深度
-    "CATBOOST_L2_LEAF_REG": 16.0,       # L2 叶节点正则系数
-    "CATBOOST_SUBSAMPLE": 0.9,          # 行采样比例
-    "CATBOOST_RSM": 0.8,                # 列采样比例（rsm = Random Subspace Method）
-    "CATBOOST_RANDOM_STRENGTH": 1.2,    # 分裂点选择随机强度
-    "CATBOOST_BAGGING_TEMPERATURE": 0.8, # Bayesian bootstrap 温度（越大越随机）
-    "CATBOOST_VERBOSE": 0,              # CatBoost 打印详细度（0=静默）
+    # XGBoost
+    "XGBOOST_NUM_ROUNDS": 3000,
+    "XGBOOST_LEARNING_RATE": 0.03,
+    "XGBOOST_MAX_DEPTH": 5,
+    "XGBOOST_MIN_CHILD_WEIGHT": 4,
+    "XGBOOST_SUBSAMPLE": 0.75,
+    "XGBOOST_COLSAMPLE": 0.6,
+    "XGBOOST_REG_ALPHA": 0.1,
+    "XGBOOST_REG_LAMBDA": 3.0,
+    "XGBOOST_HUBER_SLOPE": 1.0,
+    "XGBOOST_EARLY_STOPPING": 200,
 
-    # ------ LightGBM（树结构多样性来源之一）------
-    "LIGHTGBM_LEARNING_RATE": 0.018,    # 学习率
-    "LIGHTGBM_NUM_LEAVES": 23,          # 单棵树最大叶子数（防过拟合用小值）
-    "LIGHTGBM_MIN_CHILD_SAMPLES": 28,   # 叶节点最少样本数
-    "LIGHTGBM_MAX_DEPTH": 4,            # 最大树深度（与 num_leaves 共同约束）
-    "LIGHTGBM_SUBSAMPLE": 0.85,         # 行采样比例
-    "LIGHTGBM_COLSAMPLE": 0.72,         # 列采样比例（feature_fraction）
-    "LIGHTGBM_L1": 0.02,                # L1 正则
-    "LIGHTGBM_L2": 2.0,                 # L2 正则
+    # KNN
+    "KNN_K": 25,
 
-    # ------ XGBoost（pseudo-Huber 损失，给 stacking 提供鲁棒锚点）------
-    "XGBOOST_LEARNING_RATE": 0.03,      # 学习率
-    "XGBOOST_MAX_DEPTH": 5,             # 树深度
-    "XGBOOST_MIN_CHILD_WEIGHT": 4,      # 叶节点最小 hessian 和（相当于叶节点最小样本权重）
-    "XGBOOST_SUBSAMPLE": 0.75,          # 行采样比例
-    "XGBOOST_COLSAMPLE": 0.6,           # 列采样比例
-    "XGBOOST_REG_ALPHA": 0.1,           # L1 正则
-    "XGBOOST_REG_LAMBDA": 3.0,          # L2 正则
-    "XGBOOST_HUBER_SLOPE": 1.0,         # pseudo-Huber 损失转折点（δ）
+    # 文本残差头参数
+    "ADAPTER_HIDDEN": 256,
+    "ADAPTER_BOTTLENECK": 64,
+    "ADAPTER_EPOCHS": 28,
+    "ADAPTER_BATCH_SIZE": 256,
+    "ADAPTER_LR": 1.4e-3,
+    "ADAPTER_WEIGHT_DECAY": 2e-4,
+    "ADAPTER_PATIENCE": 5,
+    "ADAPTER_AUX_WEIGHT": 0.006,
+    "ADAPTER_WARMUP_RATIO": 0.10,
 
-    # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
-    "KNN_K": 25,                        # 近邻数 k
+    # TabM 参数
+    "TABM_HIDDEN": 160,
+    "TABM_EMBED_DIM": 16,
+    "TABM_K": 3,
+    "TABM_EPOCHS": 50,
+    "TABM_BATCH_SIZE": 512,
+    "TABM_LR": 4.5e-4,
+    "TABM_WEIGHT_DECAY": 2.5e-4,
+    "TABM_PATIENCE": 8,
+    "TABM_AUX_WEIGHT": 0.0025,
+    "TABM_WARMUP_RATIO": 0.10,
 
-    # ------ 文本头（TextModel，AdapterRegressor）------
-    "ADAPTER_HIDDEN": 256,              # 隐藏层维度
-    "ADAPTER_BOTTLENECK": 64,           # 瓶颈层维度（兼作传给 LightGBM 的辅助特征维度）
-    "ADAPTER_BATCH_SIZE": 256,          # 训练 batch size
-    "ADAPTER_LR": 1.4e-3,               # AdamW 初始学习率
-    "ADAPTER_WEIGHT_DECAY": 2e-4,       # AdamW 权重衰减
-    "ADAPTER_AUX_WEIGHT": 0.006,        # 瓶颈层 L2 辅助损失权重（正则）
-    "ADAPTER_WARMUP_RATIO": 0.10,       # 学习率 warmup 占总 steps 比例
+    # 困难样本加权
+    "HARD_WEIGHT_ALPHA": 2.0,
+    "HARD_WEIGHT_POWER": 2.0,
+    "USE_HARD_SAMPLE_WEIGHT": True,
 
-    # ------ TabM（MoE 风格表格网络）------
-    "TABM_HIDDEN": 160,                 # 隐藏层维度
-    "TABM_EMBED_DIM": 16,               # 类别 embedding 维度上限
-    "TABM_K": 3,                        # expert 分支数（MoE 的 K）
-    "TABM_BATCH_SIZE": 512,             # 训练 batch size
-    "TABM_LR": 4.5e-4,                  # AdamW 初始学习率
-    "TABM_WEIGHT_DECAY": 2.5e-4,        # AdamW 权重衰减
-    "TABM_AUX_WEIGHT": 0.0025,          # 门控均衡辅助损失权重
-    "TABM_WARMUP_RATIO": 0.10,          # 学习率 warmup 占总 steps 比例
-    "TABM_TEXT_AUX_DIM": 16,            # 拼到 TabM 数值输入的文本 PCA 前 N 维
-    "TABM_DROP_NUM_COLS": [],           # TabM 需要排除的数值列名列表
+    # stacking 子集搜索
+    "STACK_MAX_MODELS": 6,
+    "STACK_MIN_MODELS": 2,
+    "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],
+    "STACK_SOLVERS": ["convex", "nnls", "ridge"],
+    "STACK_CORR_PENALTY": 0.0015,
+    "STACK_HARD_GAIN_PENALTY": 0.0040,
+    "DIAG_TOPK_FEATURES": 30,
+    "STACK_GLOBAL_GAIN_FLOOR": -0.010,
+    "STACK_HARD_GAIN_FLOOR": -0.002,
+    "TABM_TEXT_AUX_DIM": 16,
+    "TABM_DROP_NUM_COLS": [],
 
-    # ------ 困难样本加权 ------
-    "HARD_WEIGHT_ALPHA": 2.0,           # 困难样本权重上限的增益系数（w = 1 + α·pct^β）
-    "HARD_WEIGHT_POWER": 2.0,           # 困难程度百分位的幂次 β
-    "USE_HARD_SAMPLE_WEIGHT": True,     # 是否启用困难样本加权（关闭则 w 恒为 1）
+    # Target encoding
+    "TE_SMOOTHING": 20.0,
 
-    # ------ Stacking 子集搜索（subset search）------
-    "STACK_MAX_MODELS": 6,              # 参与 stacking 的最多 base 模型数
-    "STACK_MIN_MODELS": 2,              # 参与 stacking 的最少 base 模型数
-    "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],  # 强制包含的 base 模型（搜索时不可剔除）
-    "STACK_SOLVERS": ["convex", "nnls", "ridge"],    # 要尝试的 solver 列表（convex 优先）
-    "STACK_CONVEX_MAXITER": 500,        # 凸组合 SLSQP 求解器最大迭代
-    "STACK_ELASTICNET_MAXITER": 20000,  # ElasticNetCV 坐标下降最大迭代
-    "STACK_RIDGE_ALPHAS_COUNT": 32,     # RidgeCV alpha 网格大小
-    "STACK_CORR_PENALTY": 0.0015,       # 子集残差相关度惩罚系数（越大越偏爱多样性）
-    "STACK_HARD_GAIN_PENALTY": 0.0040,  # 子集内负向 hard_gain 的惩罚系数
-    "STACK_GLOBAL_GAIN_FLOOR": -0.010,  # 可选入 stacking 的全局 gain 下界
-    "STACK_HARD_GAIN_FLOOR": -0.002,    # 可选入 stacking 的困难样本 gain 下界
-    "DIAG_TOPK_FEATURES": 30,           # CatBoost feature importance 打印前 K 项
-
-    # ------ 目标编码（Target Encoding）------
-    "TE_SMOOTHING": 20.0,               # Bayesian smoothing 系数（越大越偏向全局均值）
-
-    # ------ 多种子平均（无早停，训练完所有 seed）------
-    "SEED_LIST_MAIN": [42, 137, 2024],  # CatBoost / XGBoost / TabM 的 seed 列表
-    "SEED_LIST_AUX": [42, 137],         # LightGBM 的 seed 列表
+    # Multi-seed averaging
+    "SEED_LIST_MAIN": [42, 137, 2024],
+    "SEED_LIST_AUX": [42, 137],
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
@@ -645,9 +633,10 @@ def _train_adapter_fold(X_tr, y_tr, w_tr, X_va, y_va, X_te, device):
         torch.tensor(w_tr, dtype=torch.float32),
     ), batch_size=CONFIG["ADAPTER_BATCH_SIZE"], shuffle=True)
     va_loader = DataLoader(TensorDataset(torch.tensor(X_va, dtype=torch.float32), torch.tensor(y_va, dtype=torch.float32)), batch_size=CONFIG["ADAPTER_BATCH_SIZE"], shuffle=False)
-    total_steps = max(1, CONFIG["TextModel_epoch"] * len(tr_loader))
+    total_steps = max(1, CONFIG["ADAPTER_EPOCHS"] * len(tr_loader))
     scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["ADAPTER_WARMUP_RATIO"])
-    for _ in range(CONFIG["TextModel_epoch"]):
+    best_state, best_mse, bad = None, float("inf"), 0
+    for _ in range(CONFIG["ADAPTER_EPOCHS"]):
         model.train()
         for xb, yb, wb in tr_loader:
             xb, yb, wb = xb.to(device), yb.to(device), wb.to(device)
@@ -662,6 +651,24 @@ def _train_adapter_fold(X_tr, y_tr, w_tr, X_va, y_va, X_te, device):
             scaler.step(opt)
             scaler.update()
             scheduler.step()
+        model.eval()
+        preds = []
+        with torch.no_grad():
+            for xb, _ in va_loader:
+                xb = xb.to(device)
+                pred, _ = model(xb)
+                preds.append(pred.detach().float().cpu().numpy())
+        va_pred = np.concatenate(preds)
+        cur_mse = mse(y_va, va_pred)
+        if cur_mse < best_mse:
+            best_mse = cur_mse
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= CONFIG["ADAPTER_PATIENCE"]:
+                break
+    model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
         Xva_t = torch.tensor(X_va, dtype=torch.float32, device=device)
@@ -734,9 +741,11 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
             torch.tensor(y[tr_idx], dtype=torch.float32),
             torch.tensor(sample_weight[tr_idx], dtype=torch.float32),
         ), batch_size=CONFIG["TABM_BATCH_SIZE"], shuffle=True)
-        total_steps = max(1, CONFIG["TabM_epoch"] * len(tr_loader))
+        va_loader = DataLoader(TensorDataset(torch.tensor(Xva_num, dtype=torch.float32), torch.tensor(X_cat[va_idx], dtype=torch.long), torch.tensor(y[va_idx], dtype=torch.float32)), batch_size=CONFIG["TABM_BATCH_SIZE"], shuffle=False)
+        total_steps = max(1, CONFIG["TABM_EPOCHS"] * len(tr_loader))
         scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["TABM_WARMUP_RATIO"])
-        for _ in range(CONFIG["TabM_epoch"]):
+        best_state, best_mse, bad = None, float("inf"), 0
+        for _ in range(CONFIG["TABM_EPOCHS"]):
             model.train()
             for xb_num, xb_cat, yb, wb in tr_loader:
                 xb_num, xb_cat, yb, wb = xb_num.to(device), xb_cat.to(device), yb.to(device), wb.to(device)
@@ -752,6 +761,24 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
                 scaler.step(opt)
                 scaler.update()
                 scheduler.step()
+            model.eval()
+            preds = []
+            with torch.no_grad():
+                for xb_num, xb_cat, _ in va_loader:
+                    xb_num, xb_cat = xb_num.to(device), xb_cat.to(device)
+                    pred, _ = model(xb_num, xb_cat)
+                    preds.append(pred.detach().float().cpu().numpy())
+            va_pred = np.concatenate(preds)
+            cur_mse = mse(y[va_idx], va_pred)
+            if cur_mse < best_mse:
+                best_mse = cur_mse
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+                if bad >= CONFIG["TABM_PATIENCE"]:
+                    break
+        model.load_state_dict(best_state)
         model.eval()
         with torch.no_grad():
             va_pred, _ = model(torch.tensor(Xva_num, dtype=torch.float32, device=device), torch.tensor(X_cat[va_idx], dtype=torch.long, device=device))
@@ -771,7 +798,7 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: 
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         model = CatBoostRegressor(
-            iterations=CONFIG["CatBoost_epoch"],
+            iterations=CONFIG["CATBOOST_ITERATIONS"],
             learning_rate=CONFIG["CATBOOST_LEARNING_RATE"],
             depth=CONFIG["CATBOOST_DEPTH"],
             l2_leaf_reg=CONFIG["CATBOOST_L2_LEAF_REG"],
@@ -781,11 +808,13 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: 
             bagging_temperature=CONFIG["CATBOOST_BAGGING_TEMPERATURE"],
             loss_function="Lq:q=2",
             eval_metric="RMSE",
+            od_type="Iter",
+            od_wait=CONFIG["CATBOOST_OD_WAIT"],
             random_state=seed + fold,
             verbose=CONFIG["CATBOOST_VERBOSE"],
         )
         with suppress_stdout_stderr():
-            model.fit(X_train_df.iloc[tr_idx], y[tr_idx], cat_features=cat_idx)
+            model.fit(X_train_df.iloc[tr_idx], y[tr_idx], eval_set=(X_train_df.iloc[va_idx], y[va_idx]), cat_features=cat_idx, use_best_model=True)
         va_pred = model.predict(X_train_df.iloc[va_idx]).astype(np.float32)
         oof[va_idx] = va_pred
         test_pred += model.predict(X_test_df).astype(np.float32) / len(folds)
@@ -806,11 +835,12 @@ def train_lightgbm(X_train, y, X_test, folds, seed: int = 42):
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         dtr = lgb.Dataset(X_train.iloc[tr_idx], label=y[tr_idx])
+        dva = lgb.Dataset(X_train.iloc[va_idx], label=y[va_idx])
         with suppress_stdout_stderr():
-            model = lgb.train(params, dtr, num_boost_round=CONFIG["LightGBM_epoch"], callbacks=[lgb.log_evaluation(0)])
-        va_pred = model.predict(X_train.iloc[va_idx]).astype(np.float32)
+            model = lgb.train(params, dtr, num_boost_round=CONFIG["LIGHTGBM_NUM_ROUNDS"], valid_sets=[dva], callbacks=[lgb.early_stopping(CONFIG["LIGHTGBM_EARLY_STOPPING"], verbose=False), lgb.log_evaluation(0)])
+        va_pred = model.predict(X_train.iloc[va_idx], num_iteration=model.best_iteration).astype(np.float32)
         oof[va_idx] = va_pred
-        test_pred += model.predict(X_test).astype(np.float32) / len(folds)
+        test_pred += model.predict(X_test, num_iteration=model.best_iteration).astype(np.float32) / len(folds)
         log_stage("LightGBM", y[va_idx], va_pred, time.time() - start)
     return oof, test_pred
 
@@ -841,7 +871,8 @@ def train_xgboost(X_train, y, X_test, folds, seed: int = 42):
         dva = xgb.DMatrix(X_train.iloc[va_idx], label=y[va_idx])
         with suppress_stdout_stderr():
             model = xgb.train(
-                params, dtr, num_boost_round=CONFIG["XGBoost_epoch"],
+                params, dtr, num_boost_round=CONFIG["XGBOOST_NUM_ROUNDS"],
+                evals=[(dva, "va")], early_stopping_rounds=CONFIG["XGBOOST_EARLY_STOPPING"],
                 verbose_eval=False,
             )
         va_pred = model.predict(dva).astype(np.float32)
@@ -870,20 +901,14 @@ def train_knn_components(comp_train: np.ndarray, y: np.ndarray, comp_test: np.nd
     return oof, test_pred
 
 
-def train_with_seeds(train_fn, seeds: List[int], *args,
-                     label: Optional[str] = None,
-                     **kwargs):
-    """Run a training function across all provided seeds and average predictions."""
-    label = label or getattr(train_fn, "__name__", "train_fn")
+def train_with_seeds(train_fn, seeds: List[int], *args, **kwargs):
+    """Run a training function across multiple seeds and average OOF/test predictions."""
     oofs: List[np.ndarray] = []
     tests: List[np.ndarray] = []
     for seed in seeds:
-        t0 = time.time()
         oof, test = train_fn(*args, seed=seed, **kwargs)
         oofs.append(oof)
         tests.append(test)
-        logger.info(f"[MultiSeed] {label} seed={seed} done "
-                    f"(seeds={len(oofs)}/{len(seeds)}, time={time.time()-t0:.1f}s)")
     return np.mean(np.stack(oofs, axis=0), axis=0).astype(np.float32), \
            np.mean(np.stack(tests, axis=0), axis=0).astype(np.float32)
 
@@ -905,7 +930,7 @@ def convex_stack_solver(oof_matrix: np.ndarray, y: np.ndarray, test_matrix: np.n
         loss, w0, method="SLSQP",
         bounds=[(0.0, 1.0)] * n,
         constraints={"type": "eq", "fun": lambda w: w.sum() - 1.0},
-        options={"maxiter": CONFIG["STACK_CONVEX_MAXITER"], "ftol": 1e-9},
+        options={"maxiter": 500, "ftol": 1e-9},
     )
     w = np.clip(res.x, 0.0, None)
     s = w.sum()
@@ -931,7 +956,7 @@ def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver
         pred_tr, pred_te, coef, _ = convex_stack_solver(Xtr_s, y, Xte_s)
         return {"pred_tr": pred_tr, "pred_te": pred_te, "coef": coef, "intercept": 0.0, "label": "ConvexStack"}
     if solver_name == "ridge":
-        model = RidgeCV(alphas=np.logspace(-4, 3, CONFIG["STACK_RIDGE_ALPHAS_COUNT"]))
+        model = RidgeCV(alphas=np.logspace(-4, 3, 32))
         model.fit(Xtr_s, y)
         pred_tr = model.predict(Xtr_s).astype(np.float32)
         pred_te = model.predict(Xte_s).astype(np.float32)
@@ -939,7 +964,7 @@ def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver
         intercept = float(model.intercept_)
         label = "RidgeCV"
     elif solver_name == "elasticnet":
-        model = ElasticNetCV(l1_ratio=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8], alphas=np.logspace(-4, 1, 24), max_iter=CONFIG["STACK_ELASTICNET_MAXITER"], random_state=CONFIG["RANDOM_STATE"])
+        model = ElasticNetCV(l1_ratio=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8], alphas=np.logspace(-4, 1, 24), max_iter=20000, random_state=CONFIG["RANDOM_STATE"])
         model.fit(Xtr_s, y)
         pred_tr = model.predict(Xtr_s).astype(np.float32)
         pred_te = model.predict(Xte_s).astype(np.float32)
@@ -1142,10 +1167,9 @@ def main(args):
     seeds_main = CONFIG["SEED_LIST_MAIN"]
     seeds_aux = CONFIG["SEED_LIST_AUX"]
 
-    # --- CatBoost (multi-seed, fixed iterations, no early stop) ---
+    # --- CatBoost (multi-seed) ---
     cat_oof, cat_test = train_with_seeds(
         train_catboost, seeds_main,
-        label="CatBoost",
         X_train_df=train_tab_df, y=y, X_test_df=test_tab_df,
         categorical_features=cat_cols, folds=folds,
     )
@@ -1167,14 +1191,12 @@ def main(args):
                             pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
     lgb_oof, lgb_test = train_with_seeds(
         train_lightgbm, seeds_aux,
-        label="LightGBM",
         X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
     )
 
     # --- XGBoost (multi-seed, pseudo-Huber) ---
     xgb_oof, xgb_test = train_with_seeds(
         train_xgboost, seeds_main,
-        label="XGBoost",
         X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
     )
 
@@ -1194,7 +1216,6 @@ def main(args):
     cat_dims = [len(encoders[c].classes_) for c in cat_cols]
     tabm_oof, tabm_test = train_with_seeds(
         train_tabm, seeds_main,
-        label="TabM",
         X_num=X_num, X_cat=X_cat, y=y, sample_weight=hard_weights,
         X_num_test=X_num_test, X_cat_test=X_cat_test, cat_dims=cat_dims,
         folds=folds, device=args.device,
@@ -1245,7 +1266,7 @@ def main(args):
     log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN"]})
     try:
         full_cat_model = CatBoostRegressor(
-            iterations=CONFIG["CatBoost_epoch"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
+            iterations=CONFIG["CATBOOST_ITERATIONS"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
             l2_leaf_reg=CONFIG["CATBOOST_L2_LEAF_REG"], subsample=CONFIG["CATBOOST_SUBSAMPLE"], rsm=CONFIG["CATBOOST_RSM"],
             random_strength=CONFIG["CATBOOST_RANDOM_STRENGTH"], bagging_temperature=CONFIG["CATBOOST_BAGGING_TEMPERATURE"],
             loss_function="RMSE", eval_metric="RMSE", verbose=False, random_seed=CONFIG["RANDOM_STATE"]
