@@ -14,7 +14,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 from catboost import CatBoostRegressor
 from sklearn.decomposition import PCA
 from sklearn.linear_model import ElasticNetCV, RidgeCV
@@ -27,12 +26,11 @@ try:
 except Exception:
     nnls = None
 from torch.utils.data import DataLoader, TensorDataset
-from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
     # 路径与基础设置
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",
-    "IMAGE_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\images_dataset",
     "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",
     "N_FOLDS": 5,
     "RANDOM_STATE": 42,
@@ -42,14 +40,10 @@ CONFIG = {
 
     # backbone
     "TEXT_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
-    "VISION_MODEL": "google/vit-base-patch16-224",
     "TEXT_BATCH_SIZE": 64,
-    "VISION_BATCH_SIZE": 16,
     "TEXT_MAX_LENGTH": 256,
     "L2_NORMALIZE_EMBEDDINGS": True,
     "TEXT_PCA_DIM": 64,
-    "IMAGE_PCA_DIM": 128,
-    "USE_IMAGE_BRANCH": False,
 
     # CatBoost
     "CATBOOST_ITERATIONS": 5200,
@@ -88,6 +82,7 @@ CONFIG = {
 
     # TabM 参数
     "TABM_HIDDEN": 192,
+    "TABM_EMBED_DIM": 16,
     "TABM_K": 4,
     "TABM_EPOCHS": 60,
     "TABM_BATCH_SIZE": 512,
@@ -96,17 +91,6 @@ CONFIG = {
     "TABM_PATIENCE": 8,
     "TABM_AUX_WEIGHT": 0.0025,
     "TABM_WARMUP_RATIO": 0.10,
-
-    # 融合模型参数
-    "FUSION_D_MODEL": 64,
-    "FUSION_HEADS": 4,
-    "FUSION_EPOCHS": 24,
-    "FUSION_BATCH_SIZE": 256,
-    "FUSION_LR": 6.0e-4,
-    "FUSION_WEIGHT_DECAY": 1.5e-4,
-    "FUSION_PATIENCE": 5,
-    "FUSION_AUX_WEIGHT": 0.008,
-    "FUSION_WARMUP_RATIO": 0.10,
 
     # 困难样本加权
     "HARD_WEIGHT_ALPHA": 2.0,
@@ -120,8 +104,6 @@ CONFIG = {
     "STACK_SOLVERS": ["nnls", "anchored_nnls", "ridge"],
     "STACK_CORR_PENALTY": 0.0015,
     "STACK_HARD_GAIN_PENALTY": 0.0040,
-    "GATE_IMAGE_PENALTY": 0.20,
-    "FUSION_GATE_TARGET": [0.56, 0.34, 0.10],
     "DIAG_TOPK_FEATURES": 30,
     "STACK_GLOBAL_GAIN_FLOOR": -0.010,
     "STACK_HARD_GAIN_FLOOR": -0.002,
@@ -264,19 +246,6 @@ def concatenate_text_fields(df: pd.DataFrame, text_cols: List[str]) -> List[str]
     return df[text_cols].fillna("").apply(lambda row: " \n ".join(row.values.astype(str)), axis=1).tolist()
 
 
-def resolve_image_paths(df: pd.DataFrame, image_dir: str) -> List[Optional[str]]:
-    paths = []
-    for idx in df["id"]:
-        found = None
-        for ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
-            p = os.path.join(image_dir, f"{idx}{ext}")
-            if os.path.exists(p):
-                found = p
-                break
-        paths.append(found)
-    return paths
-
-
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
     denom = np.linalg.norm(x, axis=1, keepdims=True)
     return x / np.clip(denom, 1e-8, None)
@@ -309,69 +278,6 @@ def get_hf_text_embeddings(texts: List[str], model_name: str, batch_size: int, d
         torch.cuda.empty_cache()
     logger.info(f"Text embeddings shape={emb.shape} | time={time.time() - start:.1f}s")
     return emb
-
-
-def _image_stats(img: Image.Image) -> np.ndarray:
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    gray = arr.mean(axis=2)
-    stats = [
-        float(arr.mean()), float(arr.std()), float(gray.mean()), float(gray.std()),
-        float(np.quantile(gray, 0.1)), float(np.quantile(gray, 0.9)),
-    ]
-    hist, _ = np.histogram(gray, bins=16, range=(0, 1), density=True)
-    hist = hist / np.clip(hist.sum(), 1e-8, None)
-    entropy = -np.sum(hist * np.log(np.clip(hist, 1e-8, None)))
-    dx = np.abs(np.diff(gray, axis=0)).mean() if gray.shape[0] > 1 else 0.0
-    dy = np.abs(np.diff(gray, axis=1)).mean() if gray.shape[1] > 1 else 0.0
-    stats.extend([float(entropy), float(dx), float(dy), float(np.mean(arr[:, :, 2] > arr[:, :, 1]))])
-    return np.asarray(stats, dtype=np.float32)
-
-
-def get_hf_image_embeddings(image_paths: List[Optional[str]], model_name: str, batch_size: int, device: str) -> Tuple[np.ndarray, np.ndarray]:
-    start = time.time()
-    processor = AutoImageProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
-    amp_enabled = device.startswith("cuda")
-    all_batches, has_image = [], []
-    hidden = int(model.config.hidden_size)
-    for start_idx in range(0, len(image_paths), batch_size):
-        batch_paths = image_paths[start_idx:start_idx + batch_size]
-        valid_imgs, valid_pos = [], []
-        batch_stats = np.zeros((len(batch_paths), 10), dtype=np.float32)
-        batch_visual = np.zeros((len(batch_paths), hidden), dtype=np.float32)
-        for i, p in enumerate(batch_paths):
-            if p is None or not os.path.exists(p):
-                has_image.append(0)
-                continue
-            try:
-                img = Image.open(p).convert("RGB")
-                batch_stats[i] = _image_stats(img)
-                valid_imgs.append(img)
-                valid_pos.append(i)
-                has_image.append(1)
-            except Exception:
-                has_image.append(0)
-        if valid_imgs:
-            inputs = processor(images=valid_imgs, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=amp_enabled):
-                    outputs = model(**inputs)
-                    feats = outputs.pooler_output if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None else outputs.last_hidden_state[:, 0, :]
-            feats = feats.detach().float().cpu().numpy().astype(np.float32)
-            for pos, vec in zip(valid_pos, feats):
-                batch_visual[pos] = vec
-        batch_full = np.hstack([batch_visual, batch_stats]).astype(np.float32)
-        all_batches.append(batch_full)
-    emb = np.vstack(all_batches).astype(np.float32)
-    if CONFIG["L2_NORMALIZE_EMBEDDINGS"]:
-        emb[:, :hidden] = _l2_normalize(emb[:, :hidden]).astype(np.float32)
-    del model, processor
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
-    logger.info(f"Image embeddings shape={emb.shape} | time={time.time() - start:.1f}s")
-    return emb, np.asarray(has_image, dtype=np.int32)
 
 
 def fit_pca_features(train_arr: np.ndarray, test_arr: np.ndarray, n_components: int, name: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -687,110 +593,6 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
     return oof, test_pred
 
 
-class FusionRegressor(nn.Module):
-    def __init__(self, tab_dim: int, txt_dim: int, img_dim: int, d_model: int, n_heads: int):
-        super().__init__()
-        self.tab_proj = nn.Linear(tab_dim, d_model)
-        self.txt_proj = nn.Linear(txt_dim, d_model)
-        self.img_proj = nn.Linear(img_dim, d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.gate = nn.Sequential(nn.Linear(d_model * 3, d_model), nn.GELU(), nn.Linear(d_model, 3))
-        self.head = nn.Sequential(nn.LayerNorm(d_model * 2), nn.Linear(d_model * 2, d_model), nn.GELU(), nn.Linear(d_model, 1))
-
-    def forward(self, x_tab, x_txt, x_img):
-        t0 = self.tab_proj(x_tab)
-        t1 = self.txt_proj(x_txt)
-        t2 = self.img_proj(x_img)
-        tokens = torch.stack([t0, t1, t2], dim=1)
-        attn_out, _ = self.attn(tokens, tokens, tokens)
-        flat = torch.cat([t0, t1, t2], dim=1)
-        gate = torch.softmax(self.gate(flat), dim=1)
-        gated = gate[:, 0:1] * t0 + gate[:, 1:2] * t1 + gate[:, 2:3] * t2
-        fused = torch.cat([attn_out.mean(dim=1), gated], dim=1)
-        pred = self.head(fused).squeeze(-1)
-        return pred, gate
-
-
-def train_fusion(X_tab, X_txt, X_img, y, sample_weight, X_tab_test, X_txt_test, X_img_test, folds, device):
-    oof = np.zeros(len(X_tab), dtype=np.float32)
-    test_pred = np.zeros(len(X_tab_test), dtype=np.float32)
-    avg_gate = np.zeros(3, dtype=np.float32)
-    amp_enabled = device.startswith("cuda")
-    for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
-        start = time.time()
-        scaler_tab = StandardScaler(); scaler_txt = StandardScaler(); scaler_img = StandardScaler()
-        Xtr_tab = scaler_tab.fit_transform(X_tab[tr_idx]).astype(np.float32)
-        Xva_tab = scaler_tab.transform(X_tab[va_idx]).astype(np.float32)
-        Xte_tab = scaler_tab.transform(X_tab_test).astype(np.float32)
-        Xtr_txt = scaler_txt.fit_transform(X_txt[tr_idx]).astype(np.float32)
-        Xva_txt = scaler_txt.transform(X_txt[va_idx]).astype(np.float32)
-        Xte_txt = scaler_txt.transform(X_txt_test).astype(np.float32)
-        Xtr_img = scaler_img.fit_transform(X_img[tr_idx]).astype(np.float32)
-        Xva_img = scaler_img.transform(X_img[va_idx]).astype(np.float32)
-        Xte_img = scaler_img.transform(X_img_test).astype(np.float32)
-        model = FusionRegressor(Xtr_tab.shape[1], Xtr_txt.shape[1], Xtr_img.shape[1], CONFIG["FUSION_D_MODEL"], CONFIG["FUSION_HEADS"]).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=CONFIG["FUSION_LR"], weight_decay=CONFIG["FUSION_WEIGHT_DECAY"])
-        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
-        tr_loader = DataLoader(TensorDataset(torch.tensor(Xtr_tab, dtype=torch.float32), torch.tensor(Xtr_txt, dtype=torch.float32), torch.tensor(Xtr_img, dtype=torch.float32), torch.tensor(y[tr_idx], dtype=torch.float32), torch.tensor(sample_weight[tr_idx], dtype=torch.float32)), batch_size=CONFIG["FUSION_BATCH_SIZE"], shuffle=True)
-        va_loader = DataLoader(TensorDataset(torch.tensor(Xva_tab, dtype=torch.float32), torch.tensor(Xva_txt, dtype=torch.float32), torch.tensor(Xva_img, dtype=torch.float32), torch.tensor(y[va_idx], dtype=torch.float32)), batch_size=CONFIG["FUSION_BATCH_SIZE"], shuffle=False)
-        total_steps = max(1, CONFIG["FUSION_EPOCHS"] * len(tr_loader))
-        scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["FUSION_WARMUP_RATIO"])
-        best_state, best_mse, bad = None, float("inf"), 0
-        for _ in range(CONFIG["FUSION_EPOCHS"]):
-            model.train()
-            for xb_tab, xb_txt, xb_img, yb, wb in tr_loader:
-                xb_tab, xb_txt, xb_img, yb, wb = xb_tab.to(device), xb_txt.to(device), xb_img.to(device), yb.to(device), wb.to(device)
-                opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=amp_enabled):
-                    pred, gate = model(xb_tab, xb_txt, xb_img)
-                    gate_target = torch.tensor(CONFIG["FUSION_GATE_TARGET"], device=device, dtype=gate.dtype)
-                    aux_target = ((gate.mean(dim=0) - gate_target) ** 2).mean()
-                    aux_img = (gate[:, 2] ** 2).mean()
-                    aux = aux_target + CONFIG["GATE_IMAGE_PENALTY"] * aux_img
-                    loss = weighted_mse_tensor(pred, yb, wb) + CONFIG["FUSION_AUX_WEIGHT"] * aux
-                scaler.scale(loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(opt)
-                scaler.update()
-                scheduler.step()
-            model.eval()
-            preds = []
-            with torch.no_grad():
-                for xb_tab, xb_txt, xb_img, _ in va_loader:
-                    xb_tab, xb_txt, xb_img = xb_tab.to(device), xb_txt.to(device), xb_img.to(device)
-                    pred, _ = model(xb_tab, xb_txt, xb_img)
-                    preds.append(pred.detach().float().cpu().numpy())
-            va_pred = np.concatenate(preds)
-            cur_mse = mse(y[va_idx], va_pred)
-            if cur_mse < best_mse:
-                best_mse = cur_mse
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                bad = 0
-            else:
-                bad += 1
-                if bad >= CONFIG["FUSION_PATIENCE"]:
-                    break
-        model.load_state_dict(best_state)
-        model.eval()
-        with torch.no_grad():
-            Xva_tab_t = torch.tensor(Xva_tab, dtype=torch.float32, device=device)
-            Xva_txt_t = torch.tensor(Xva_txt, dtype=torch.float32, device=device)
-            Xva_img_t = torch.tensor(Xva_img, dtype=torch.float32, device=device)
-            Xte_tab_t = torch.tensor(Xte_tab, dtype=torch.float32, device=device)
-            Xte_txt_t = torch.tensor(Xte_txt, dtype=torch.float32, device=device)
-            Xte_img_t = torch.tensor(Xte_img, dtype=torch.float32, device=device)
-            va_pred, _ = model(Xva_tab_t, Xva_txt_t, Xva_img_t)
-            te_pred, te_gate = model(Xte_tab_t, Xte_txt_t, Xte_img_t)
-        va_pred = va_pred.detach().float().cpu().numpy().astype(np.float32)
-        te_pred = te_pred.detach().float().cpu().numpy().astype(np.float32)
-        oof[va_idx] = va_pred
-        test_pred += te_pred / len(folds)
-        avg_gate += te_gate.detach().float().cpu().numpy().mean(axis=0) / len(folds)
-        log_stage("Fusion", y[va_idx], va_pred, time.time() - start)
-    return oof, test_pred, avg_gate.astype(np.float32)
-
-
 def train_catboost(X_train_df, y, X_test_df, categorical_features, folds):
     oof = np.zeros(len(X_train_df), dtype=np.float32)
     test_pred = np.zeros(len(X_test_df), dtype=np.float32)
@@ -1002,24 +804,11 @@ def main(args):
     test_texts = concatenate_text_fields(test_df, text_cols)
     text_emb_train = get_hf_text_embeddings(train_texts, args.text_model, args.batch_size, args.device, CONFIG["TEXT_MAX_LENGTH"])
     text_emb_test = get_hf_text_embeddings(test_texts, args.text_model, args.batch_size, args.device, CONFIG["TEXT_MAX_LENGTH"])
-    if CONFIG["USE_IMAGE_BRANCH"]:
-        train_img_paths = resolve_image_paths(train_df, args.image_dir)
-        test_img_paths = resolve_image_paths(test_df, args.image_dir)
-        img_emb_train, has_img_train = get_hf_image_embeddings(train_img_paths, args.vision_model, args.img_batch_size, args.device)
-        img_emb_test, has_img_test = get_hf_image_embeddings(test_img_paths, args.vision_model, args.img_batch_size, args.device)
-        img_low_train, img_low_test = fit_pca_features(img_emb_train, img_emb_test, CONFIG["IMAGE_PCA_DIM"], "Image")
-    else:
-        has_img_train = np.zeros(len(train_df), dtype=np.int32)
-        has_img_test = np.zeros(len(test_df), dtype=np.int32)
-        img_low_train = np.zeros((len(train_df), 0), dtype=np.float32)
-        img_low_test = np.zeros((len(test_df), 0), dtype=np.float32)
     text_low_train, text_low_test = fit_pca_features(text_emb_train, text_emb_test, CONFIG["TEXT_PCA_DIM"], "Text")
 
     drop_cols = [c for c in text_cols + ["settlement_index", "id"] if c in train_proc.columns]
     train_tab_df = train_proc.drop(columns=drop_cols).copy()
     test_tab_df = test_proc.drop(columns=drop_cols).copy()
-    train_tab_df["has_image"] = has_img_train
-    test_tab_df["has_image"] = has_img_test
     cat_cols = [c for c in categorical_cols if c in train_tab_df.columns]
     num_cols = [c for c in train_tab_df.columns if c not in cat_cols]
 
@@ -1028,14 +817,8 @@ def main(args):
     hard_weights = compute_hard_weights(y - cat_oof) if CONFIG["USE_HARD_SAMPLE_WEIGHT"] else np.ones_like(y, dtype=np.float32)
 
     txt_resid_oof, txt_resid_test, text_adapt_train, text_adapt_test = train_adapter_cv("TextResidual", text_low_train, residual_target, hard_weights, text_low_test, folds, args.device)
-    img_resid_oof = np.zeros(len(train_df), dtype=np.float32)
-    img_resid_test = np.zeros(len(test_df), dtype=np.float32)
-    img_adapt_train = np.zeros((len(train_df), 0), dtype=np.float32)
-    img_adapt_test = np.zeros((len(test_df), 0), dtype=np.float32)
     text_head_oof = (cat_oof + txt_resid_oof).astype(np.float32)
     text_head_test = (cat_test + txt_resid_test).astype(np.float32)
-    img_head_oof = (cat_oof + img_resid_oof).astype(np.float32)
-    img_head_test = (cat_test + img_resid_test).astype(np.float32)
 
     X_lgb = pd.concat([train_tab_df.reset_index(drop=True), pd.DataFrame(text_adapt_train, columns=[f"txt_adapt_{i}" for i in range(text_adapt_train.shape[1])])], axis=1)
     X_lgb_test = pd.concat([test_tab_df.reset_index(drop=True), pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
@@ -1052,10 +835,6 @@ def main(args):
     tabm_oof = (cat_oof + tabm_resid_oof).astype(np.float32)
     tabm_test = (cat_test + tabm_resid_test).astype(np.float32)
 
-    fusion_oof = np.zeros(len(train_df), dtype=np.float32)
-    fusion_test = np.zeros(len(test_df), dtype=np.float32)
-    avg_gate = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-
     base_oof = np.vstack([cat_oof, lgb_oof, tabm_oof, text_head_oof]).T.astype(np.float32)
     base_test = np.vstack([cat_test, lgb_test, tabm_test, text_head_test]).T.astype(np.float32)
     model_names = ["CatBoost", "LightGBM", "TabM", "TextResidual"]
@@ -1066,12 +845,10 @@ def main(args):
     for name, pred in zip(model_names + ["StackingFinal"], [cat_oof, lgb_oof, tabm_oof, text_head_oof, stack_oof]):
         log_prediction_diagnostics(name, y, pred)
     logger.info(f"Text PCA explained dim={CONFIG['TEXT_PCA_DIM']} | approx_signal_ratio_check=see explained variance above")
-    logger.info("Image branch is disabled in current conservative mainline.")
     logger.info(f"Tabular feature dim           = {train_tab_df.shape[1]}")
     logger.info(f"LGB augmented feature dim     = {X_lgb.shape[1]}")
     logger.info(f"TabM numeric dim             = {X_num.shape[1]}")
     logger.info(f"TabM categorical cols        = {len(cat_cols)}")
-    logger.info(f"Average fusion gates         = tab={avg_gate[0]:.4f} | text={avg_gate[1]:.4f} | image={avg_gate[2]:.4f}")
     pred_dict = {
         "CatBoost": cat_oof,
         "LightGBM": lgb_oof,
@@ -1129,13 +906,10 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Conservative push line: subset-search stacking + stable CatBoost/TabM + weighted residual adapters")
     parser.add_argument("--data_dir", type=str, default=CONFIG["DATA_DIR"])
-    parser.add_argument("--image_dir", type=str, default=CONFIG["IMAGE_DIR"])
     parser.add_argument("--output_dir", type=str, default=CONFIG["OUTPUT_DIR"])
     parser.add_argument("--n_folds", type=int, default=CONFIG["N_FOLDS"])
     parser.add_argument("--text_model", type=str, default=CONFIG["TEXT_MODEL"])
-    parser.add_argument("--vision_model", type=str, default=CONFIG["VISION_MODEL"])
     parser.add_argument("--batch_size", type=int, default=CONFIG["TEXT_BATCH_SIZE"])
-    parser.add_argument("--img_batch_size", type=int, default=CONFIG["VISION_BATCH_SIZE"])
     parser.add_argument("--device", type=str, default=CONFIG["DEVICE"])
     args = parser.parse_args()
     main(args)
