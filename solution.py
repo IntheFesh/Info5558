@@ -32,6 +32,21 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
+    # ========================================================================
+    # TRAINING DURATION SUMMARY (single place to tune all epoch/round counts)
+    # ------------------------------------------------------------------------
+    #   CatBoost            CATBOOST_ITERATIONS  + CATBOOST_OD_WAIT
+    #   LightGBM            LIGHTGBM_NUM_ROUNDS  + LIGHTGBM_EARLY_STOPPING
+    #   XGBoost             XGBOOST_NUM_ROUNDS   + XGBOOST_EARLY_STOPPING
+    #   TextModel adapter   ADAPTER_EPOCHS       + ADAPTER_PATIENCE
+    #   TabM                TABM_EPOCHS          + TABM_PATIENCE
+    #   KNN                 (no epochs; lazy learner)
+    #   Convex stacker      STACK_CONVEX_MAXITER
+    #   ElasticNet stacker  STACK_ELASTICNET_MAXITER
+    #   Ridge stacker       STACK_RIDGE_ALPHAS_COUNT (alpha grid size)
+    #   Multi-seed          SEED_LIST_MAIN / SEED_LIST_AUX + SEED_ES_TOL
+    # ========================================================================
+
     # 路径与基础设置
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",
     "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",
@@ -121,6 +136,9 @@ CONFIG = {
     "STACK_MIN_MODELS": 2,
     "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],
     "STACK_SOLVERS": ["convex", "nnls", "ridge"],
+    "STACK_CONVEX_MAXITER": 500,
+    "STACK_ELASTICNET_MAXITER": 20000,
+    "STACK_RIDGE_ALPHAS_COUNT": 32,
     "STACK_CORR_PENALTY": 0.0015,
     "STACK_HARD_GAIN_PENALTY": 0.0040,
     "DIAG_TOPK_FEATURES": 30,
@@ -964,7 +982,7 @@ def convex_stack_solver(oof_matrix: np.ndarray, y: np.ndarray, test_matrix: np.n
         loss, w0, method="SLSQP",
         bounds=[(0.0, 1.0)] * n,
         constraints={"type": "eq", "fun": lambda w: w.sum() - 1.0},
-        options={"maxiter": 500, "ftol": 1e-9},
+        options={"maxiter": CONFIG["STACK_CONVEX_MAXITER"], "ftol": 1e-9},
     )
     w = np.clip(res.x, 0.0, None)
     s = w.sum()
@@ -990,7 +1008,7 @@ def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver
         pred_tr, pred_te, coef, _ = convex_stack_solver(Xtr_s, y, Xte_s)
         return {"pred_tr": pred_tr, "pred_te": pred_te, "coef": coef, "intercept": 0.0, "label": "ConvexStack"}
     if solver_name == "ridge":
-        model = RidgeCV(alphas=np.logspace(-4, 3, 32))
+        model = RidgeCV(alphas=np.logspace(-4, 3, CONFIG["STACK_RIDGE_ALPHAS_COUNT"]))
         model.fit(Xtr_s, y)
         pred_tr = model.predict(Xtr_s).astype(np.float32)
         pred_te = model.predict(Xte_s).astype(np.float32)
@@ -998,7 +1016,7 @@ def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver
         intercept = float(model.intercept_)
         label = "RidgeCV"
     elif solver_name == "elasticnet":
-        model = ElasticNetCV(l1_ratio=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8], alphas=np.logspace(-4, 1, 24), max_iter=20000, random_state=CONFIG["RANDOM_STATE"])
+        model = ElasticNetCV(l1_ratio=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8], alphas=np.logspace(-4, 1, 24), max_iter=CONFIG["STACK_ELASTICNET_MAXITER"], random_state=CONFIG["RANDOM_STATE"])
         model.fit(Xtr_s, y)
         pred_tr = model.predict(Xtr_s).astype(np.float32)
         pred_te = model.predict(Xte_s).astype(np.float32)
