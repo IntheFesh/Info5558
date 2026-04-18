@@ -33,20 +33,23 @@ from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
     # ========================================================================
-    # 训练轮数总览（TRAINING DURATION SUMMARY）— 调所有模型训练时长的入口
+    # 训练轮数总览（所有模型训练轮数的硬性规定入口，不使用任何早停机制）
     # ------------------------------------------------------------------------
-    #   CatBoost          CATBOOST_ITERATIONS   + CATBOOST_OD_WAIT
-    #   LightGBM          LIGHTGBM_NUM_ROUNDS   + LIGHTGBM_EARLY_STOPPING
-    #   XGBoost           XGBOOST_NUM_ROUNDS    + XGBOOST_EARLY_STOPPING
-    #   TextModel         ADAPTER_EPOCHS        + ADAPTER_PATIENCE
-    #   TabM              TABM_EPOCHS           + TABM_PATIENCE
+    #   CatBoost          CatBoost_epoch
+    #   LightGBM          LightGBM_epoch
+    #   XGBoost           XGBoost_epoch
+    #   TextModel         TextModel_epoch
+    #   TabM              TabM_epoch
     #   KNN               惰性学习，无训练轮数
-    #   Convex stacker    STACK_CONVEX_MAXITER
-    #   ElasticNet stacker STACK_ELASTICNET_MAXITER
-    #   Ridge stacker     STACK_RIDGE_ALPHAS_COUNT（alpha 网格搜索大小）
-    #   多种子平均         SEED_LIST_MAIN / SEED_LIST_AUX + SEED_ES_TOL
-    # 备注：8000 训练样本 + 5 折 = 每折 6400 训练量，以下默认值已按该规模缩减
+    # 备注：8000 训练样本 + 5 折 = 每折 6400 训练量，轮数为固定训练轮数
     # ========================================================================
+
+    # ------ 每个模型的硬性训练轮数（无早停）------
+    "CatBoost_epoch": 3000,             # CatBoost 固定迭代数（无早停）
+    "LightGBM_epoch": 2000,             # LightGBM 固定 boosting 轮数（无早停）
+    "XGBoost_epoch": 1500,              # XGBoost 固定 boosting 轮数（无早停）
+    "TextModel_epoch": 25,              # TextModel / AdapterRegressor 固定训练 epoch 数
+    "TabM_epoch": 40,                   # TabM 固定训练 epoch 数
 
     # ------ 路径与基础设置 ------
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
@@ -66,7 +69,6 @@ CONFIG = {
     "TEXT_PCA_DIM": 96,                 # 文本嵌入 PCA 降维后的维度
 
     # ------ CatBoost（梯度提升树主力）------
-    "CATBOOST_ITERATIONS": 1800,        # 最大迭代数上限（实际由 OD_WAIT 早停控制）
     "CATBOOST_LEARNING_RATE": 0.018,    # 学习率
     "CATBOOST_DEPTH": 6,                # 树深度
     "CATBOOST_L2_LEAF_REG": 16.0,       # L2 叶节点正则系数
@@ -74,11 +76,9 @@ CONFIG = {
     "CATBOOST_RSM": 0.8,                # 列采样比例（rsm = Random Subspace Method）
     "CATBOOST_RANDOM_STRENGTH": 1.2,    # 分裂点选择随机强度
     "CATBOOST_BAGGING_TEMPERATURE": 0.8, # Bayesian bootstrap 温度（越大越随机）
-    "CATBOOST_OD_WAIT": 60,             # 早停 patience：验证集连续多少轮无改善后停止
     "CATBOOST_VERBOSE": 0,              # CatBoost 打印详细度（0=静默）
 
     # ------ LightGBM（树结构多样性来源之一）------
-    "LIGHTGBM_NUM_ROUNDS": 1500,        # 最大 boosting 轮数上限
     "LIGHTGBM_LEARNING_RATE": 0.018,    # 学习率
     "LIGHTGBM_NUM_LEAVES": 23,          # 单棵树最大叶子数（防过拟合用小值）
     "LIGHTGBM_MIN_CHILD_SAMPLES": 28,   # 叶节点最少样本数
@@ -87,10 +87,8 @@ CONFIG = {
     "LIGHTGBM_COLSAMPLE": 0.72,         # 列采样比例（feature_fraction）
     "LIGHTGBM_L1": 0.02,                # L1 正则
     "LIGHTGBM_L2": 2.0,                 # L2 正则
-    "LIGHTGBM_EARLY_STOPPING": 60,      # 早停 patience
 
     # ------ XGBoost（pseudo-Huber 损失，给 stacking 提供鲁棒锚点）------
-    "XGBOOST_NUM_ROUNDS": 1500,         # 最大 boosting 轮数上限
     "XGBOOST_LEARNING_RATE": 0.03,      # 学习率
     "XGBOOST_MAX_DEPTH": 5,             # 树深度
     "XGBOOST_MIN_CHILD_WEIGHT": 4,      # 叶节点最小 hessian 和（相当于叶节点最小样本权重）
@@ -99,7 +97,6 @@ CONFIG = {
     "XGBOOST_REG_ALPHA": 0.1,           # L1 正则
     "XGBOOST_REG_LAMBDA": 3.0,          # L2 正则
     "XGBOOST_HUBER_SLOPE": 1.0,         # pseudo-Huber 损失转折点（δ）
-    "XGBOOST_EARLY_STOPPING": 60,       # 早停 patience
 
     # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
     "KNN_K": 25,                        # 近邻数 k
@@ -107,11 +104,9 @@ CONFIG = {
     # ------ 文本头（TextModel，AdapterRegressor）------
     "ADAPTER_HIDDEN": 256,              # 隐藏层维度
     "ADAPTER_BOTTLENECK": 64,           # 瓶颈层维度（兼作传给 LightGBM 的辅助特征维度）
-    "ADAPTER_EPOCHS": 20,               # 最大训练 epoch 数
     "ADAPTER_BATCH_SIZE": 256,          # 训练 batch size
     "ADAPTER_LR": 1.4e-3,               # AdamW 初始学习率
     "ADAPTER_WEIGHT_DECAY": 2e-4,       # AdamW 权重衰减
-    "ADAPTER_PATIENCE": 4,              # 早停 patience（验证集 MSE 连续多少 epoch 无改善后停）
     "ADAPTER_AUX_WEIGHT": 0.006,        # 瓶颈层 L2 辅助损失权重（正则）
     "ADAPTER_WARMUP_RATIO": 0.10,       # 学习率 warmup 占总 steps 比例
 
@@ -119,11 +114,9 @@ CONFIG = {
     "TABM_HIDDEN": 160,                 # 隐藏层维度
     "TABM_EMBED_DIM": 16,               # 类别 embedding 维度上限
     "TABM_K": 3,                        # expert 分支数（MoE 的 K）
-    "TABM_EPOCHS": 30,                  # 最大训练 epoch 数
     "TABM_BATCH_SIZE": 512,             # 训练 batch size
     "TABM_LR": 4.5e-4,                  # AdamW 初始学习率
     "TABM_WEIGHT_DECAY": 2.5e-4,        # AdamW 权重衰减
-    "TABM_PATIENCE": 5,                 # 早停 patience
     "TABM_AUX_WEIGHT": 0.0025,          # 门控均衡辅助损失权重
     "TABM_WARMUP_RATIO": 0.10,          # 学习率 warmup 占总 steps 比例
     "TABM_TEXT_AUX_DIM": 16,            # 拼到 TabM 数值输入的文本 PCA 前 N 维
@@ -151,13 +144,9 @@ CONFIG = {
     # ------ 目标编码（Target Encoding）------
     "TE_SMOOTHING": 20.0,               # Bayesian smoothing 系数（越大越偏向全局均值）
 
-    # ------ 多种子平均与早停 ------
-    # 8000 样本下树模型方差已经很小，多 seed 收益有限。默认 2 个 seed 即可；
-    # SeedES 会在第 N 个 seed 相对 N-1 改善 < SEED_ES_TOL 时提前终止。
-    "SEED_LIST_MAIN": [42, 137],        # CatBoost / XGBoost / TabM 的 seed 列表
-    "SEED_LIST_AUX": [42],              # LightGBM 的 seed 列表（更便宜，单 seed 足够）
-    "SEED_ES_TOL": 0.003,               # seed 级早停阈值：改善 < 此值就停
-    "SEED_ES_MIN_SEEDS": 2,             # 至少训练完这么多 seed 才允许早停
+    # ------ 多种子平均（无早停，训练完所有 seed）------
+    "SEED_LIST_MAIN": [42, 137, 2024],  # CatBoost / XGBoost / TabM 的 seed 列表
+    "SEED_LIST_AUX": [42, 137],         # LightGBM 的 seed 列表
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
@@ -656,10 +645,9 @@ def _train_adapter_fold(X_tr, y_tr, w_tr, X_va, y_va, X_te, device):
         torch.tensor(w_tr, dtype=torch.float32),
     ), batch_size=CONFIG["ADAPTER_BATCH_SIZE"], shuffle=True)
     va_loader = DataLoader(TensorDataset(torch.tensor(X_va, dtype=torch.float32), torch.tensor(y_va, dtype=torch.float32)), batch_size=CONFIG["ADAPTER_BATCH_SIZE"], shuffle=False)
-    total_steps = max(1, CONFIG["ADAPTER_EPOCHS"] * len(tr_loader))
+    total_steps = max(1, CONFIG["TextModel_epoch"] * len(tr_loader))
     scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["ADAPTER_WARMUP_RATIO"])
-    best_state, best_mse, bad = None, float("inf"), 0
-    for _ in range(CONFIG["ADAPTER_EPOCHS"]):
+    for _ in range(CONFIG["TextModel_epoch"]):
         model.train()
         for xb, yb, wb in tr_loader:
             xb, yb, wb = xb.to(device), yb.to(device), wb.to(device)
@@ -674,24 +662,6 @@ def _train_adapter_fold(X_tr, y_tr, w_tr, X_va, y_va, X_te, device):
             scaler.step(opt)
             scaler.update()
             scheduler.step()
-        model.eval()
-        preds = []
-        with torch.no_grad():
-            for xb, _ in va_loader:
-                xb = xb.to(device)
-                pred, _ = model(xb)
-                preds.append(pred.detach().float().cpu().numpy())
-        va_pred = np.concatenate(preds)
-        cur_mse = mse(y_va, va_pred)
-        if cur_mse < best_mse:
-            best_mse = cur_mse
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            bad = 0
-        else:
-            bad += 1
-            if bad >= CONFIG["ADAPTER_PATIENCE"]:
-                break
-    model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
         Xva_t = torch.tensor(X_va, dtype=torch.float32, device=device)
@@ -764,11 +734,9 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
             torch.tensor(y[tr_idx], dtype=torch.float32),
             torch.tensor(sample_weight[tr_idx], dtype=torch.float32),
         ), batch_size=CONFIG["TABM_BATCH_SIZE"], shuffle=True)
-        va_loader = DataLoader(TensorDataset(torch.tensor(Xva_num, dtype=torch.float32), torch.tensor(X_cat[va_idx], dtype=torch.long), torch.tensor(y[va_idx], dtype=torch.float32)), batch_size=CONFIG["TABM_BATCH_SIZE"], shuffle=False)
-        total_steps = max(1, CONFIG["TABM_EPOCHS"] * len(tr_loader))
+        total_steps = max(1, CONFIG["TabM_epoch"] * len(tr_loader))
         scheduler = make_cosine_scheduler(opt, total_steps, CONFIG["TABM_WARMUP_RATIO"])
-        best_state, best_mse, bad = None, float("inf"), 0
-        for _ in range(CONFIG["TABM_EPOCHS"]):
+        for _ in range(CONFIG["TabM_epoch"]):
             model.train()
             for xb_num, xb_cat, yb, wb in tr_loader:
                 xb_num, xb_cat, yb, wb = xb_num.to(device), xb_cat.to(device), yb.to(device), wb.to(device)
@@ -784,24 +752,6 @@ def train_tabm(X_num, X_cat, y, sample_weight, X_num_test, X_cat_test, cat_dims,
                 scaler.step(opt)
                 scaler.update()
                 scheduler.step()
-            model.eval()
-            preds = []
-            with torch.no_grad():
-                for xb_num, xb_cat, _ in va_loader:
-                    xb_num, xb_cat = xb_num.to(device), xb_cat.to(device)
-                    pred, _ = model(xb_num, xb_cat)
-                    preds.append(pred.detach().float().cpu().numpy())
-            va_pred = np.concatenate(preds)
-            cur_mse = mse(y[va_idx], va_pred)
-            if cur_mse < best_mse:
-                best_mse = cur_mse
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                bad = 0
-            else:
-                bad += 1
-                if bad >= CONFIG["TABM_PATIENCE"]:
-                    break
-        model.load_state_dict(best_state)
         model.eval()
         with torch.no_grad():
             va_pred, _ = model(torch.tensor(Xva_num, dtype=torch.float32, device=device), torch.tensor(X_cat[va_idx], dtype=torch.long, device=device))
@@ -821,7 +771,7 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: 
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         model = CatBoostRegressor(
-            iterations=CONFIG["CATBOOST_ITERATIONS"],
+            iterations=CONFIG["CatBoost_epoch"],
             learning_rate=CONFIG["CATBOOST_LEARNING_RATE"],
             depth=CONFIG["CATBOOST_DEPTH"],
             l2_leaf_reg=CONFIG["CATBOOST_L2_LEAF_REG"],
@@ -831,13 +781,11 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: 
             bagging_temperature=CONFIG["CATBOOST_BAGGING_TEMPERATURE"],
             loss_function="Lq:q=2",
             eval_metric="RMSE",
-            od_type="Iter",
-            od_wait=CONFIG["CATBOOST_OD_WAIT"],
             random_state=seed + fold,
             verbose=CONFIG["CATBOOST_VERBOSE"],
         )
         with suppress_stdout_stderr():
-            model.fit(X_train_df.iloc[tr_idx], y[tr_idx], eval_set=(X_train_df.iloc[va_idx], y[va_idx]), cat_features=cat_idx, use_best_model=True)
+            model.fit(X_train_df.iloc[tr_idx], y[tr_idx], cat_features=cat_idx)
         va_pred = model.predict(X_train_df.iloc[va_idx]).astype(np.float32)
         oof[va_idx] = va_pred
         test_pred += model.predict(X_test_df).astype(np.float32) / len(folds)
@@ -858,12 +806,11 @@ def train_lightgbm(X_train, y, X_test, folds, seed: int = 42):
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         dtr = lgb.Dataset(X_train.iloc[tr_idx], label=y[tr_idx])
-        dva = lgb.Dataset(X_train.iloc[va_idx], label=y[va_idx])
         with suppress_stdout_stderr():
-            model = lgb.train(params, dtr, num_boost_round=CONFIG["LIGHTGBM_NUM_ROUNDS"], valid_sets=[dva], callbacks=[lgb.early_stopping(CONFIG["LIGHTGBM_EARLY_STOPPING"], verbose=False), lgb.log_evaluation(0)])
-        va_pred = model.predict(X_train.iloc[va_idx], num_iteration=model.best_iteration).astype(np.float32)
+            model = lgb.train(params, dtr, num_boost_round=CONFIG["LightGBM_epoch"], callbacks=[lgb.log_evaluation(0)])
+        va_pred = model.predict(X_train.iloc[va_idx]).astype(np.float32)
         oof[va_idx] = va_pred
-        test_pred += model.predict(X_test, num_iteration=model.best_iteration).astype(np.float32) / len(folds)
+        test_pred += model.predict(X_test).astype(np.float32) / len(folds)
         log_stage("LightGBM", y[va_idx], va_pred, time.time() - start)
     return oof, test_pred
 
@@ -894,8 +841,7 @@ def train_xgboost(X_train, y, X_test, folds, seed: int = 42):
         dva = xgb.DMatrix(X_train.iloc[va_idx], label=y[va_idx])
         with suppress_stdout_stderr():
             model = xgb.train(
-                params, dtr, num_boost_round=CONFIG["XGBOOST_NUM_ROUNDS"],
-                evals=[(dva, "va")], early_stopping_rounds=CONFIG["XGBOOST_EARLY_STOPPING"],
+                params, dtr, num_boost_round=CONFIG["XGBoost_epoch"],
                 verbose_eval=False,
             )
         va_pred = model.predict(dva).astype(np.float32)
@@ -925,45 +871,19 @@ def train_knn_components(comp_train: np.ndarray, y: np.ndarray, comp_test: np.nd
 
 
 def train_with_seeds(train_fn, seeds: List[int], *args,
-                     y_ref: Optional[np.ndarray] = None,
-                     tol: Optional[float] = None,
-                     min_seeds: Optional[int] = None,
                      label: Optional[str] = None,
                      **kwargs):
-    """Run a training function across multiple seeds and average predictions.
-
-    If y_ref is provided, checks how much each additional seed improves the
-    blended-OOF RMSE; if the marginal improvement is below `tol` (absolute)
-    after at least `min_seeds` have been trained, early-stops.
-    """
-    tol = CONFIG.get("SEED_ES_TOL", 0.003) if tol is None else tol
-    min_seeds = CONFIG.get("SEED_ES_MIN_SEEDS", 2) if min_seeds is None else min_seeds
+    """Run a training function across all provided seeds and average predictions."""
     label = label or getattr(train_fn, "__name__", "train_fn")
     oofs: List[np.ndarray] = []
     tests: List[np.ndarray] = []
-    prev_rmse = None
     for seed in seeds:
         t0 = time.time()
         oof, test = train_fn(*args, seed=seed, **kwargs)
         oofs.append(oof)
         tests.append(test)
-        if y_ref is None:
-            continue
-        mean_oof = np.mean(np.stack(oofs, axis=0), axis=0)
-        cur_rmse = float(np.sqrt(np.mean((mean_oof - y_ref) ** 2)))
-        if prev_rmse is None:
-            logger.info(f"[SeedES] {label} seed={seed} blended_oof_rmse={cur_rmse:.4f} "
-                        f"(seeds={len(oofs)}, time={time.time()-t0:.1f}s)")
-        else:
-            improvement = prev_rmse - cur_rmse
-            logger.info(f"[SeedES] {label} seed={seed} blended_oof_rmse={cur_rmse:.4f} "
-                        f"improvement={improvement:+.4f} (seeds={len(oofs)}, "
-                        f"time={time.time()-t0:.1f}s)")
-            if len(oofs) >= min_seeds and improvement < tol:
-                logger.info(f"[SeedES] {label} early-stopped at {len(oofs)} seeds "
-                            f"(improvement {improvement:+.4f} < tol {tol:.4f})")
-                break
-        prev_rmse = cur_rmse
+        logger.info(f"[MultiSeed] {label} seed={seed} done "
+                    f"(seeds={len(oofs)}/{len(seeds)}, time={time.time()-t0:.1f}s)")
     return np.mean(np.stack(oofs, axis=0), axis=0).astype(np.float32), \
            np.mean(np.stack(tests, axis=0), axis=0).astype(np.float32)
 
@@ -1222,10 +1142,10 @@ def main(args):
     seeds_main = CONFIG["SEED_LIST_MAIN"]
     seeds_aux = CONFIG["SEED_LIST_AUX"]
 
-    # --- CatBoost (multi-seed with blended-OOF early stop) ---
+    # --- CatBoost (multi-seed, fixed iterations, no early stop) ---
     cat_oof, cat_test = train_with_seeds(
         train_catboost, seeds_main,
-        y_ref=y, label="CatBoost",
+        label="CatBoost",
         X_train_df=train_tab_df, y=y, X_test_df=test_tab_df,
         categorical_features=cat_cols, folds=folds,
     )
@@ -1247,14 +1167,14 @@ def main(args):
                             pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
     lgb_oof, lgb_test = train_with_seeds(
         train_lightgbm, seeds_aux,
-        y_ref=y, label="LightGBM",
+        label="LightGBM",
         X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
     )
 
     # --- XGBoost (multi-seed, pseudo-Huber) ---
     xgb_oof, xgb_test = train_with_seeds(
         train_xgboost, seeds_main,
-        y_ref=y, label="XGBoost",
+        label="XGBoost",
         X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
     )
 
@@ -1274,7 +1194,7 @@ def main(args):
     cat_dims = [len(encoders[c].classes_) for c in cat_cols]
     tabm_oof, tabm_test = train_with_seeds(
         train_tabm, seeds_main,
-        y_ref=y, label="TabM",
+        label="TabM",
         X_num=X_num, X_cat=X_cat, y=y, sample_weight=hard_weights,
         X_num_test=X_num_test, X_cat_test=X_cat_test, cat_dims=cat_dims,
         folds=folds, device=args.device,
@@ -1325,7 +1245,7 @@ def main(args):
     log_residual_structure(y, {k: pred_dict[k] for k in ["CatBoost", "LightGBM", "XGBoost", "TabM", "TextModel", "KNN"]})
     try:
         full_cat_model = CatBoostRegressor(
-            iterations=CONFIG["CATBOOST_ITERATIONS"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
+            iterations=CONFIG["CatBoost_epoch"], learning_rate=CONFIG["CATBOOST_LEARNING_RATE"], depth=CONFIG["CATBOOST_DEPTH"],
             l2_leaf_reg=CONFIG["CATBOOST_L2_LEAF_REG"], subsample=CONFIG["CATBOOST_SUBSAMPLE"], rsm=CONFIG["CATBOOST_RSM"],
             random_strength=CONFIG["CATBOOST_RANDOM_STRENGTH"], bagging_temperature=CONFIG["CATBOOST_BAGGING_TEMPERATURE"],
             loss_function="RMSE", eval_metric="RMSE", verbose=False, random_seed=CONFIG["RANDOM_STATE"]
