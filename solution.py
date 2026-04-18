@@ -33,128 +33,131 @@ from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
     # ========================================================================
-    # TRAINING DURATION SUMMARY (single place to tune all epoch/round counts)
+    # 训练轮数总览（TRAINING DURATION SUMMARY）— 调所有模型训练时长的入口
     # ------------------------------------------------------------------------
-    #   CatBoost            CATBOOST_ITERATIONS  + CATBOOST_OD_WAIT
-    #   LightGBM            LIGHTGBM_NUM_ROUNDS  + LIGHTGBM_EARLY_STOPPING
-    #   XGBoost             XGBOOST_NUM_ROUNDS   + XGBOOST_EARLY_STOPPING
-    #   TextModel adapter   ADAPTER_EPOCHS       + ADAPTER_PATIENCE
-    #   TabM                TABM_EPOCHS          + TABM_PATIENCE
-    #   KNN                 (no epochs; lazy learner)
-    #   Convex stacker      STACK_CONVEX_MAXITER
-    #   ElasticNet stacker  STACK_ELASTICNET_MAXITER
-    #   Ridge stacker       STACK_RIDGE_ALPHAS_COUNT (alpha grid size)
-    #   Multi-seed          SEED_LIST_MAIN / SEED_LIST_AUX + SEED_ES_TOL
+    #   CatBoost          CATBOOST_ITERATIONS   + CATBOOST_OD_WAIT
+    #   LightGBM          LIGHTGBM_NUM_ROUNDS   + LIGHTGBM_EARLY_STOPPING
+    #   XGBoost           XGBOOST_NUM_ROUNDS    + XGBOOST_EARLY_STOPPING
+    #   TextModel         ADAPTER_EPOCHS        + ADAPTER_PATIENCE
+    #   TabM              TABM_EPOCHS           + TABM_PATIENCE
+    #   KNN               惰性学习，无训练轮数
+    #   Convex stacker    STACK_CONVEX_MAXITER
+    #   ElasticNet stacker STACK_ELASTICNET_MAXITER
+    #   Ridge stacker     STACK_RIDGE_ALPHAS_COUNT（alpha 网格搜索大小）
+    #   多种子平均         SEED_LIST_MAIN / SEED_LIST_AUX + SEED_ES_TOL
+    # 备注：8000 训练样本 + 5 折 = 每折 6400 训练量，以下默认值已按该规模缩减
     # ========================================================================
 
-    # 路径与基础设置
-    "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",
-    "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",
-    "N_FOLDS": 5,
-    "RANDOM_STATE": 42,
-    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
-    "LOG_LEVEL": "INFO",
-    "SUPPRESS_HF_WARNINGS": True,
+    # ------ 路径与基础设置 ------
+    "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",  # 训练/测试 CSV 所在目录
+    "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",  # 提交结果输出目录
+    "N_FOLDS": 5,                       # 交叉验证折数
+    "RANDOM_STATE": 42,                 # 全局随机种子（fold 划分、PCA、ElasticNet 用）
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",  # 训练设备，优先 GPU
+    "LOG_LEVEL": "INFO",                # 日志级别（DEBUG / INFO / WARNING）
+    "SUPPRESS_HF_WARNINGS": True,       # 是否屏蔽 HuggingFace 和 warnings 的冗余输出
 
-    # backbone
-    "TEXT_MODEL": "sentence-transformers/all-mpnet-base-v2",
-    "TEXT_MODEL_FALLBACK": "BAAI/bge-small-en-v1.5",
-    "TEXT_BATCH_SIZE": 32,
-    "TEXT_MAX_LENGTH": 256,
-    "L2_NORMALIZE_EMBEDDINGS": True,
-    "TEXT_PCA_DIM": 96,
+    # ------ 文本编码器（HF Transformers）------
+    "TEXT_MODEL": "sentence-transformers/all-mpnet-base-v2",   # 主文本编码器，MPNet-base 768 维
+    "TEXT_MODEL_FALLBACK": "BAAI/bge-small-en-v1.5",           # 下载失败时降级模型，BGE-small 384 维
+    "TEXT_BATCH_SIZE": 32,              # 文本编码推理 batch（MPNet batch=32 约占 2G 显存）
+    "TEXT_MAX_LENGTH": 256,             # tokenizer 最大截断长度
+    "L2_NORMALIZE_EMBEDDINGS": True,    # 是否对文本向量做 L2 归一化
+    "TEXT_PCA_DIM": 96,                 # 文本嵌入 PCA 降维后的维度
 
-    # CatBoost
-    "CATBOOST_ITERATIONS": 3500,
-    "CATBOOST_LEARNING_RATE": 0.018,
-    "CATBOOST_DEPTH": 6,
-    "CATBOOST_L2_LEAF_REG": 16.0,
-    "CATBOOST_SUBSAMPLE": 0.9,
-    "CATBOOST_RSM": 0.8,
-    "CATBOOST_RANDOM_STRENGTH": 1.2,
-    "CATBOOST_BAGGING_TEMPERATURE": 0.8,
-    "CATBOOST_OD_WAIT": 150,
-    "CATBOOST_VERBOSE": 0,
+    # ------ CatBoost（梯度提升树主力）------
+    "CATBOOST_ITERATIONS": 1800,        # 最大迭代数上限（实际由 OD_WAIT 早停控制）
+    "CATBOOST_LEARNING_RATE": 0.018,    # 学习率
+    "CATBOOST_DEPTH": 6,                # 树深度
+    "CATBOOST_L2_LEAF_REG": 16.0,       # L2 叶节点正则系数
+    "CATBOOST_SUBSAMPLE": 0.9,          # 行采样比例
+    "CATBOOST_RSM": 0.8,                # 列采样比例（rsm = Random Subspace Method）
+    "CATBOOST_RANDOM_STRENGTH": 1.2,    # 分裂点选择随机强度
+    "CATBOOST_BAGGING_TEMPERATURE": 0.8, # Bayesian bootstrap 温度（越大越随机）
+    "CATBOOST_OD_WAIT": 60,             # 早停 patience：验证集连续多少轮无改善后停止
+    "CATBOOST_VERBOSE": 0,              # CatBoost 打印详细度（0=静默）
 
-    # LightGBM
-    "LIGHTGBM_NUM_ROUNDS": 2200,
-    "LIGHTGBM_LEARNING_RATE": 0.018,
-    "LIGHTGBM_NUM_LEAVES": 23,
-    "LIGHTGBM_MIN_CHILD_SAMPLES": 28,
-    "LIGHTGBM_MAX_DEPTH": 4,
-    "LIGHTGBM_SUBSAMPLE": 0.85,
-    "LIGHTGBM_COLSAMPLE": 0.72,
-    "LIGHTGBM_L1": 0.02,
-    "LIGHTGBM_L2": 2.0,
-    "LIGHTGBM_EARLY_STOPPING": 120,
+    # ------ LightGBM（树结构多样性来源之一）------
+    "LIGHTGBM_NUM_ROUNDS": 1500,        # 最大 boosting 轮数上限
+    "LIGHTGBM_LEARNING_RATE": 0.018,    # 学习率
+    "LIGHTGBM_NUM_LEAVES": 23,          # 单棵树最大叶子数（防过拟合用小值）
+    "LIGHTGBM_MIN_CHILD_SAMPLES": 28,   # 叶节点最少样本数
+    "LIGHTGBM_MAX_DEPTH": 4,            # 最大树深度（与 num_leaves 共同约束）
+    "LIGHTGBM_SUBSAMPLE": 0.85,         # 行采样比例
+    "LIGHTGBM_COLSAMPLE": 0.72,         # 列采样比例（feature_fraction）
+    "LIGHTGBM_L1": 0.02,                # L1 正则
+    "LIGHTGBM_L2": 2.0,                 # L2 正则
+    "LIGHTGBM_EARLY_STOPPING": 60,      # 早停 patience
 
-    # XGBoost
-    "XGBOOST_NUM_ROUNDS": 2000,
-    "XGBOOST_LEARNING_RATE": 0.03,
-    "XGBOOST_MAX_DEPTH": 5,
-    "XGBOOST_MIN_CHILD_WEIGHT": 4,
-    "XGBOOST_SUBSAMPLE": 0.75,
-    "XGBOOST_COLSAMPLE": 0.6,
-    "XGBOOST_REG_ALPHA": 0.1,
-    "XGBOOST_REG_LAMBDA": 3.0,
-    "XGBOOST_HUBER_SLOPE": 1.0,
-    "XGBOOST_EARLY_STOPPING": 100,
+    # ------ XGBoost（pseudo-Huber 损失，给 stacking 提供鲁棒锚点）------
+    "XGBOOST_NUM_ROUNDS": 1500,         # 最大 boosting 轮数上限
+    "XGBOOST_LEARNING_RATE": 0.03,      # 学习率
+    "XGBOOST_MAX_DEPTH": 5,             # 树深度
+    "XGBOOST_MIN_CHILD_WEIGHT": 4,      # 叶节点最小 hessian 和（相当于叶节点最小样本权重）
+    "XGBOOST_SUBSAMPLE": 0.75,          # 行采样比例
+    "XGBOOST_COLSAMPLE": 0.6,           # 列采样比例
+    "XGBOOST_REG_ALPHA": 0.1,           # L1 正则
+    "XGBOOST_REG_LAMBDA": 3.0,          # L2 正则
+    "XGBOOST_HUBER_SLOPE": 1.0,         # pseudo-Huber 损失转折点（δ）
+    "XGBOOST_EARLY_STOPPING": 60,       # 早停 patience
 
-    # KNN
-    "KNN_K": 25,
+    # ------ KNN（惰性近邻学习器，在 comp 子分空间捕捉局部一致性）------
+    "KNN_K": 25,                        # 近邻数 k
 
-    # 文本残差头参数
-    "ADAPTER_HIDDEN": 256,
-    "ADAPTER_BOTTLENECK": 64,
-    "ADAPTER_EPOCHS": 28,
-    "ADAPTER_BATCH_SIZE": 256,
-    "ADAPTER_LR": 1.4e-3,
-    "ADAPTER_WEIGHT_DECAY": 2e-4,
-    "ADAPTER_PATIENCE": 5,
-    "ADAPTER_AUX_WEIGHT": 0.006,
-    "ADAPTER_WARMUP_RATIO": 0.10,
+    # ------ 文本头（TextModel，AdapterRegressor）------
+    "ADAPTER_HIDDEN": 256,              # 隐藏层维度
+    "ADAPTER_BOTTLENECK": 64,           # 瓶颈层维度（兼作传给 LightGBM 的辅助特征维度）
+    "ADAPTER_EPOCHS": 20,               # 最大训练 epoch 数
+    "ADAPTER_BATCH_SIZE": 256,          # 训练 batch size
+    "ADAPTER_LR": 1.4e-3,               # AdamW 初始学习率
+    "ADAPTER_WEIGHT_DECAY": 2e-4,       # AdamW 权重衰减
+    "ADAPTER_PATIENCE": 4,              # 早停 patience（验证集 MSE 连续多少 epoch 无改善后停）
+    "ADAPTER_AUX_WEIGHT": 0.006,        # 瓶颈层 L2 辅助损失权重（正则）
+    "ADAPTER_WARMUP_RATIO": 0.10,       # 学习率 warmup 占总 steps 比例
 
-    # TabM 参数
-    "TABM_HIDDEN": 160,
-    "TABM_EMBED_DIM": 16,
-    "TABM_K": 3,
-    "TABM_EPOCHS": 50,
-    "TABM_BATCH_SIZE": 512,
-    "TABM_LR": 4.5e-4,
-    "TABM_WEIGHT_DECAY": 2.5e-4,
-    "TABM_PATIENCE": 8,
-    "TABM_AUX_WEIGHT": 0.0025,
-    "TABM_WARMUP_RATIO": 0.10,
+    # ------ TabM（MoE 风格表格网络）------
+    "TABM_HIDDEN": 160,                 # 隐藏层维度
+    "TABM_EMBED_DIM": 16,               # 类别 embedding 维度上限
+    "TABM_K": 3,                        # expert 分支数（MoE 的 K）
+    "TABM_EPOCHS": 30,                  # 最大训练 epoch 数
+    "TABM_BATCH_SIZE": 512,             # 训练 batch size
+    "TABM_LR": 4.5e-4,                  # AdamW 初始学习率
+    "TABM_WEIGHT_DECAY": 2.5e-4,        # AdamW 权重衰减
+    "TABM_PATIENCE": 5,                 # 早停 patience
+    "TABM_AUX_WEIGHT": 0.0025,          # 门控均衡辅助损失权重
+    "TABM_WARMUP_RATIO": 0.10,          # 学习率 warmup 占总 steps 比例
+    "TABM_TEXT_AUX_DIM": 16,            # 拼到 TabM 数值输入的文本 PCA 前 N 维
+    "TABM_DROP_NUM_COLS": [],           # TabM 需要排除的数值列名列表
 
-    # 困难样本加权
-    "HARD_WEIGHT_ALPHA": 2.0,
-    "HARD_WEIGHT_POWER": 2.0,
-    "USE_HARD_SAMPLE_WEIGHT": True,
+    # ------ 困难样本加权 ------
+    "HARD_WEIGHT_ALPHA": 2.0,           # 困难样本权重上限的增益系数（w = 1 + α·pct^β）
+    "HARD_WEIGHT_POWER": 2.0,           # 困难程度百分位的幂次 β
+    "USE_HARD_SAMPLE_WEIGHT": True,     # 是否启用困难样本加权（关闭则 w 恒为 1）
 
-    # stacking 子集搜索
-    "STACK_MAX_MODELS": 6,
-    "STACK_MIN_MODELS": 2,
-    "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],
-    "STACK_SOLVERS": ["convex", "nnls", "ridge"],
-    "STACK_CONVEX_MAXITER": 500,
-    "STACK_ELASTICNET_MAXITER": 20000,
-    "STACK_RIDGE_ALPHAS_COUNT": 32,
-    "STACK_CORR_PENALTY": 0.0015,
-    "STACK_HARD_GAIN_PENALTY": 0.0040,
-    "DIAG_TOPK_FEATURES": 30,
-    "STACK_GLOBAL_GAIN_FLOOR": -0.010,
-    "STACK_HARD_GAIN_FLOOR": -0.002,
-    "TABM_TEXT_AUX_DIM": 16,
-    "TABM_DROP_NUM_COLS": [],
+    # ------ Stacking 子集搜索（subset search）------
+    "STACK_MAX_MODELS": 6,              # 参与 stacking 的最多 base 模型数
+    "STACK_MIN_MODELS": 2,              # 参与 stacking 的最少 base 模型数
+    "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],  # 强制包含的 base 模型（搜索时不可剔除）
+    "STACK_SOLVERS": ["convex", "nnls", "ridge"],    # 要尝试的 solver 列表（convex 优先）
+    "STACK_CONVEX_MAXITER": 500,        # 凸组合 SLSQP 求解器最大迭代
+    "STACK_ELASTICNET_MAXITER": 20000,  # ElasticNetCV 坐标下降最大迭代
+    "STACK_RIDGE_ALPHAS_COUNT": 32,     # RidgeCV alpha 网格大小
+    "STACK_CORR_PENALTY": 0.0015,       # 子集残差相关度惩罚系数（越大越偏爱多样性）
+    "STACK_HARD_GAIN_PENALTY": 0.0040,  # 子集内负向 hard_gain 的惩罚系数
+    "STACK_GLOBAL_GAIN_FLOOR": -0.010,  # 可选入 stacking 的全局 gain 下界
+    "STACK_HARD_GAIN_FLOOR": -0.002,    # 可选入 stacking 的困难样本 gain 下界
+    "DIAG_TOPK_FEATURES": 30,           # CatBoost feature importance 打印前 K 项
 
-    # Target encoding
-    "TE_SMOOTHING": 20.0,
+    # ------ 目标编码（Target Encoding）------
+    "TE_SMOOTHING": 20.0,               # Bayesian smoothing 系数（越大越偏向全局均值）
 
-    # Multi-seed averaging
-    "SEED_LIST_MAIN": [42, 137, 2024],
-    "SEED_LIST_AUX": [42, 137],
-    "SEED_ES_TOL": 0.003,
-    "SEED_ES_MIN_SEEDS": 2,
+    # ------ 多种子平均与早停 ------
+    # 8000 样本下树模型方差已经很小，多 seed 收益有限。默认 2 个 seed 即可；
+    # SeedES 会在第 N 个 seed 相对 N-1 改善 < SEED_ES_TOL 时提前终止。
+    "SEED_LIST_MAIN": [42, 137],        # CatBoost / XGBoost / TabM 的 seed 列表
+    "SEED_LIST_AUX": [42],              # LightGBM 的 seed 列表（更便宜，单 seed 足够）
+    "SEED_ES_TOL": 0.003,               # seed 级早停阈值：改善 < 此值就停
+    "SEED_ES_MIN_SEEDS": 2,             # 至少训练完这么多 seed 才允许早停
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
