@@ -32,6 +32,21 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModel, AutoTokenizer
 
 CONFIG = {
+    # ========================================================================
+    # TRAINING DURATION SUMMARY (single place to tune all epoch/round counts)
+    # ------------------------------------------------------------------------
+    #   CatBoost            CATBOOST_ITERATIONS  + CATBOOST_OD_WAIT
+    #   LightGBM            LIGHTGBM_NUM_ROUNDS  + LIGHTGBM_EARLY_STOPPING
+    #   XGBoost             XGBOOST_NUM_ROUNDS   + XGBOOST_EARLY_STOPPING
+    #   TextModel adapter   ADAPTER_EPOCHS       + ADAPTER_PATIENCE
+    #   TabM                TABM_EPOCHS          + TABM_PATIENCE
+    #   KNN                 (no epochs; lazy learner)
+    #   Convex stacker      STACK_CONVEX_MAXITER
+    #   ElasticNet stacker  STACK_ELASTICNET_MAXITER
+    #   Ridge stacker       STACK_RIDGE_ALPHAS_COUNT (alpha grid size)
+    #   Multi-seed          SEED_LIST_MAIN / SEED_LIST_AUX + SEED_ES_TOL
+    # ========================================================================
+
     # 路径与基础设置
     "DATA_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026",
     "OUTPUT_DIR": r"G:\PythonProject\Info5558\app-of-gen-ai-deep-learning-wustl-spring-2026\result",
@@ -50,7 +65,7 @@ CONFIG = {
     "TEXT_PCA_DIM": 96,
 
     # CatBoost
-    "CATBOOST_ITERATIONS": 5200,
+    "CATBOOST_ITERATIONS": 3500,
     "CATBOOST_LEARNING_RATE": 0.018,
     "CATBOOST_DEPTH": 6,
     "CATBOOST_L2_LEAF_REG": 16.0,
@@ -58,11 +73,11 @@ CONFIG = {
     "CATBOOST_RSM": 0.8,
     "CATBOOST_RANDOM_STRENGTH": 1.2,
     "CATBOOST_BAGGING_TEMPERATURE": 0.8,
-    "CATBOOST_OD_WAIT": 350,
+    "CATBOOST_OD_WAIT": 150,
     "CATBOOST_VERBOSE": 0,
 
     # LightGBM
-    "LIGHTGBM_NUM_ROUNDS": 3200,
+    "LIGHTGBM_NUM_ROUNDS": 2200,
     "LIGHTGBM_LEARNING_RATE": 0.018,
     "LIGHTGBM_NUM_LEAVES": 23,
     "LIGHTGBM_MIN_CHILD_SAMPLES": 28,
@@ -71,10 +86,10 @@ CONFIG = {
     "LIGHTGBM_COLSAMPLE": 0.72,
     "LIGHTGBM_L1": 0.02,
     "LIGHTGBM_L2": 2.0,
-    "LIGHTGBM_EARLY_STOPPING": 220,
+    "LIGHTGBM_EARLY_STOPPING": 120,
 
     # XGBoost
-    "XGBOOST_NUM_ROUNDS": 3000,
+    "XGBOOST_NUM_ROUNDS": 2000,
     "XGBOOST_LEARNING_RATE": 0.03,
     "XGBOOST_MAX_DEPTH": 5,
     "XGBOOST_MIN_CHILD_WEIGHT": 4,
@@ -83,7 +98,7 @@ CONFIG = {
     "XGBOOST_REG_ALPHA": 0.1,
     "XGBOOST_REG_LAMBDA": 3.0,
     "XGBOOST_HUBER_SLOPE": 1.0,
-    "XGBOOST_EARLY_STOPPING": 200,
+    "XGBOOST_EARLY_STOPPING": 100,
 
     # KNN
     "KNN_K": 25,
@@ -121,6 +136,9 @@ CONFIG = {
     "STACK_MIN_MODELS": 2,
     "STACK_FORCE_INCLUDE": ["CatBoost", "XGBoost"],
     "STACK_SOLVERS": ["convex", "nnls", "ridge"],
+    "STACK_CONVEX_MAXITER": 500,
+    "STACK_ELASTICNET_MAXITER": 20000,
+    "STACK_RIDGE_ALPHAS_COUNT": 32,
     "STACK_CORR_PENALTY": 0.0015,
     "STACK_HARD_GAIN_PENALTY": 0.0040,
     "DIAG_TOPK_FEATURES": 30,
@@ -135,6 +153,8 @@ CONFIG = {
     # Multi-seed averaging
     "SEED_LIST_MAIN": [42, 137, 2024],
     "SEED_LIST_AUX": [42, 137],
+    "SEED_ES_TOL": 0.003,
+    "SEED_ES_MIN_SEEDS": 2,
 }
 
 if CONFIG["SUPPRESS_HF_WARNINGS"]:
@@ -901,14 +921,46 @@ def train_knn_components(comp_train: np.ndarray, y: np.ndarray, comp_test: np.nd
     return oof, test_pred
 
 
-def train_with_seeds(train_fn, seeds: List[int], *args, **kwargs):
-    """Run a training function across multiple seeds and average OOF/test predictions."""
+def train_with_seeds(train_fn, seeds: List[int], *args,
+                     y_ref: Optional[np.ndarray] = None,
+                     tol: Optional[float] = None,
+                     min_seeds: Optional[int] = None,
+                     label: Optional[str] = None,
+                     **kwargs):
+    """Run a training function across multiple seeds and average predictions.
+
+    If y_ref is provided, checks how much each additional seed improves the
+    blended-OOF RMSE; if the marginal improvement is below `tol` (absolute)
+    after at least `min_seeds` have been trained, early-stops.
+    """
+    tol = CONFIG.get("SEED_ES_TOL", 0.003) if tol is None else tol
+    min_seeds = CONFIG.get("SEED_ES_MIN_SEEDS", 2) if min_seeds is None else min_seeds
+    label = label or getattr(train_fn, "__name__", "train_fn")
     oofs: List[np.ndarray] = []
     tests: List[np.ndarray] = []
+    prev_rmse = None
     for seed in seeds:
+        t0 = time.time()
         oof, test = train_fn(*args, seed=seed, **kwargs)
         oofs.append(oof)
         tests.append(test)
+        if y_ref is None:
+            continue
+        mean_oof = np.mean(np.stack(oofs, axis=0), axis=0)
+        cur_rmse = float(np.sqrt(np.mean((mean_oof - y_ref) ** 2)))
+        if prev_rmse is None:
+            logger.info(f"[SeedES] {label} seed={seed} blended_oof_rmse={cur_rmse:.4f} "
+                        f"(seeds={len(oofs)}, time={time.time()-t0:.1f}s)")
+        else:
+            improvement = prev_rmse - cur_rmse
+            logger.info(f"[SeedES] {label} seed={seed} blended_oof_rmse={cur_rmse:.4f} "
+                        f"improvement={improvement:+.4f} (seeds={len(oofs)}, "
+                        f"time={time.time()-t0:.1f}s)")
+            if len(oofs) >= min_seeds and improvement < tol:
+                logger.info(f"[SeedES] {label} early-stopped at {len(oofs)} seeds "
+                            f"(improvement {improvement:+.4f} < tol {tol:.4f})")
+                break
+        prev_rmse = cur_rmse
     return np.mean(np.stack(oofs, axis=0), axis=0).astype(np.float32), \
            np.mean(np.stack(tests, axis=0), axis=0).astype(np.float32)
 
@@ -930,7 +982,7 @@ def convex_stack_solver(oof_matrix: np.ndarray, y: np.ndarray, test_matrix: np.n
         loss, w0, method="SLSQP",
         bounds=[(0.0, 1.0)] * n,
         constraints={"type": "eq", "fun": lambda w: w.sum() - 1.0},
-        options={"maxiter": 500, "ftol": 1e-9},
+        options={"maxiter": CONFIG["STACK_CONVEX_MAXITER"], "ftol": 1e-9},
     )
     w = np.clip(res.x, 0.0, None)
     s = w.sum()
@@ -956,7 +1008,7 @@ def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver
         pred_tr, pred_te, coef, _ = convex_stack_solver(Xtr_s, y, Xte_s)
         return {"pred_tr": pred_tr, "pred_te": pred_te, "coef": coef, "intercept": 0.0, "label": "ConvexStack"}
     if solver_name == "ridge":
-        model = RidgeCV(alphas=np.logspace(-4, 3, 32))
+        model = RidgeCV(alphas=np.logspace(-4, 3, CONFIG["STACK_RIDGE_ALPHAS_COUNT"]))
         model.fit(Xtr_s, y)
         pred_tr = model.predict(Xtr_s).astype(np.float32)
         pred_te = model.predict(Xte_s).astype(np.float32)
@@ -964,7 +1016,7 @@ def fit_stack_solver(Xtr_s: np.ndarray, y: np.ndarray, Xte_s: np.ndarray, solver
         intercept = float(model.intercept_)
         label = "RidgeCV"
     elif solver_name == "elasticnet":
-        model = ElasticNetCV(l1_ratio=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8], alphas=np.logspace(-4, 1, 24), max_iter=20000, random_state=CONFIG["RANDOM_STATE"])
+        model = ElasticNetCV(l1_ratio=[0.05, 0.1, 0.2, 0.4, 0.6, 0.8], alphas=np.logspace(-4, 1, 24), max_iter=CONFIG["STACK_ELASTICNET_MAXITER"], random_state=CONFIG["RANDOM_STATE"])
         model.fit(Xtr_s, y)
         pred_tr = model.predict(Xtr_s).astype(np.float32)
         pred_te = model.predict(Xte_s).astype(np.float32)
@@ -1167,9 +1219,10 @@ def main(args):
     seeds_main = CONFIG["SEED_LIST_MAIN"]
     seeds_aux = CONFIG["SEED_LIST_AUX"]
 
-    # --- CatBoost (multi-seed) ---
+    # --- CatBoost (multi-seed with blended-OOF early stop) ---
     cat_oof, cat_test = train_with_seeds(
         train_catboost, seeds_main,
+        y_ref=y, label="CatBoost",
         X_train_df=train_tab_df, y=y, X_test_df=test_tab_df,
         categorical_features=cat_cols, folds=folds,
     )
@@ -1191,12 +1244,14 @@ def main(args):
                             pd.DataFrame(text_adapt_test, columns=[f"txt_adapt_{i}" for i in range(text_adapt_test.shape[1])])], axis=1)
     lgb_oof, lgb_test = train_with_seeds(
         train_lightgbm, seeds_aux,
+        y_ref=y, label="LightGBM",
         X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
     )
 
     # --- XGBoost (multi-seed, pseudo-Huber) ---
     xgb_oof, xgb_test = train_with_seeds(
         train_xgboost, seeds_main,
+        y_ref=y, label="XGBoost",
         X_train=X_lgb, y=y, X_test=X_lgb_test, folds=folds,
     )
 
@@ -1216,6 +1271,7 @@ def main(args):
     cat_dims = [len(encoders[c].classes_) for c in cat_cols]
     tabm_oof, tabm_test = train_with_seeds(
         train_tabm, seeds_main,
+        y_ref=y, label="TabM",
         X_num=X_num, X_cat=X_cat, y=y, sample_weight=hard_weights,
         X_num_test=X_num_test, X_cat_test=X_cat_test, cat_dims=cat_dims,
         folds=folds, device=args.device,
