@@ -46,9 +46,9 @@ CONFIG = {
     # ========================================================================
 
     # ------ 每个模型的硬性训练轮数（无早停）------
-    "CatBoost_epoch": 5500,             # CatBoost 固定迭代数
-    "LightGBM_epoch": 3200,             # LightGBM 固定 boosting 轮数
-    "XGBoost_epoch": 3200,              # XGBoost 固定 boosting 轮数
+    "CatBoost_epoch": 5000,             # CatBoost 固定迭代数
+    "LightGBM_epoch": 3000,             # LightGBM 固定 boosting 轮数
+    "XGBoost_epoch": 3000,              # XGBoost 固定 boosting 轮数
     "TextModel_epoch": 32,              # TextModel / AdapterRegressor 固定训练 epoch 数
     "TabM_epoch": 32,                   # TabM 固定训练 epoch 数
 
@@ -827,7 +827,7 @@ def train_catboost(X_train_df, y, X_test_df, categorical_features, folds, seed: 
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
         start = time.time()
         model = CatBoostRegressor(
-            iterations=CONFIG["CATBOOST_ITERATIONS"],
+            iterations=CONFIG["CatBoost_epoch"],
             learning_rate=CONFIG["CATBOOST_LEARNING_RATE"],
             depth=CONFIG["CATBOOST_DEPTH"],
             l2_leaf_reg=CONFIG["CATBOOST_L2_LEAF_REG"],
